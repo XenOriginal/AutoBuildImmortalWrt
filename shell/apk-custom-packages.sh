@@ -202,8 +202,8 @@ CUSTOM_PACKAGES="$CUSTOM_PACKAGES luci-app-openclash luci-compat kmod-tun kmod-i
 # 3. 剔除冗余显卡/显示驱动 (无头软路由环境)
 CUSTOM_PACKAGES="$CUSTOM_PACKAGES -kmod-drm -kmod-drm-i915 -i915-firmware-dmc -kmod-drm-kms-helper -kmod-drm-buddy -kmod-drm-display-helper -kmod-fb -kmod-acpi-video"
 
-# 4. 剔除冗余网卡驱动 (排除螃蟹卡、Intel千兆/2.5G卡及其他冷门网卡)
-CUSTOM_PACKAGES="$CUSTOM_PACKAGES -kmod-r8125 -kmod-r8168 -kmod-r8126 -kmod-r8101 -kmod-igc -kmod-igb -kmod-igbvf -kmod-e1000 -kmod-e1000e -kmod-amd-xgbe -kmod-amazon-ena -kmod-bnx2 -kmod-tg3 -kmod-tulip -kmod-forcedeth -kmod-pcnet32"
+# 4. 剔除所有冗余网卡驱动 (涵盖螃蟹卡、Intel千兆/2.5G、古董百兆卡、虚拟机网卡及冷门架构网卡)
+CUSTOM_PACKAGES="$CUSTOM_PACKAGES -kmod-r8125 -kmod-r8168 -kmod-r8126 -kmod-r8101 -kmod-igc -kmod-igb -kmod-igbvf -kmod-e1000 -kmod-e1000e -kmod-amd-xgbe -kmod-amazon-ena -kmod-bnx2 -kmod-tg3 -kmod-tulip -kmod-forcedeth -kmod-pcnet32 -kmod-8139cp -kmod-8139too -kmod-vmxnet3 -kmod-dwmac-intel -kmod-stmmac-core -kmod-phy-ax88796b"
 
-# 5. 剔除冗余 USB 网卡及冷门存储驱动 (如果不外接USB网卡则安全剔除)
-CUSTOM_PACKAGES="$CUSTOM_PACKAGES -kmod-usb-net-asix -kmod-usb-net-rtl8150 -kmod-usb-net-rtl8152-vendor -kmod-usb-storage-extras"
+# 5. 剔除所有 USB 网卡及冷门存储驱动
+CUSTOM_PACKAGES="$CUSTOM_PACKAGES -kmod-usb-net -kmod-usb-net-asix -kmod-usb-net-asix-ax88179 -kmod-usb-net-rtl8150 -kmod-usb-net-rtl8152-vendor -kmod-usb-storage-extras"
