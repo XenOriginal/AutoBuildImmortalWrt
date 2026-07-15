@@ -187,3 +187,23 @@
 #CUSTOM_PACKAGES="$CUSTOM_PACKAGES luci-i18n-wifischedule-zh-cn"
 #CUSTOM_PACKAGES="$CUSTOM_PACKAGES luci-i18n-xinetd-zh-cn"
 #CUSTOM_PACKAGES="$CUSTOM_PACKAGES luci-i18n-xlnetacc-zh-cn"
+
+# =================================================================
+# 自定义精简与核心业务保留 (Intel Atom C3958 + Mellanox/Intel 10G)
+# =================================================================
+
+# 1. 保留的核心业务 (Docker, 驱动, NFS等)
+CUSTOM_PACKAGES="$CUSTOM_PACKAGES docker dockerd docker-compose luci-app-dockerman kmod-fs-nfs kmod-fs-nfs-common kmod-fs-nfs-v3 kmod-fs-nfs-v4 kmod-mlx5-core kmod-ixgbe kmod-ixgbevf"
+
+# 2. 启用 OpenClash 及其依赖
+# (注: 源文件中已有此行，你也可以直接去上面取消那行的注释。这里为了方便统一写在一起)
+CUSTOM_PACKAGES="$CUSTOM_PACKAGES luci-app-openclash luci-compat kmod-tun kmod-inet-diag kmod-nft-tproxy bash curl ip-full unzip"
+
+# 3. 剔除冗余显卡/显示驱动 (无头软路由环境)
+CUSTOM_PACKAGES="$CUSTOM_PACKAGES -kmod-drm -kmod-drm-i915 -i915-firmware-dmc -kmod-drm-kms-helper -kmod-drm-buddy -kmod-drm-display-helper -kmod-fb -kmod-acpi-video"
+
+# 4. 剔除冗余网卡驱动 (排除螃蟹卡、Intel千兆/2.5G卡及其他冷门网卡)
+CUSTOM_PACKAGES="$CUSTOM_PACKAGES -kmod-r8125 -kmod-r8168 -kmod-r8126 -kmod-r8101 -kmod-igc -kmod-igb -kmod-igbvf -kmod-e1000 -kmod-e1000e -kmod-amd-xgbe -kmod-amazon-ena -kmod-bnx2 -kmod-tg3 -kmod-tulip -kmod-forcedeth -kmod-pcnet32"
+
+# 5. 剔除冗余 USB 网卡及冷门存储驱动 (如果不外接USB网卡则安全剔除)
+CUSTOM_PACKAGES="$CUSTOM_PACKAGES -kmod-usb-net-asix -kmod-usb-net-rtl8150 -kmod-usb-net-rtl8152-vendor -kmod-usb-storage-extras"
