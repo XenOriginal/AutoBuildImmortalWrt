@@ -193,7 +193,7 @@
 # =================================================================
 
 # 1. 保留的核心业务 (Docker, 驱动, NFS等)
-CUSTOM_PACKAGES="$CUSTOM_PACKAGES docker dockerd docker-compose luci-app-dockerman kmod-fs-nfs kmod-fs-nfs-common kmod-fs-nfs-v3 kmod-fs-nfs-v4 kmod-mlx5-core kmod-ixgbe kmod-ixgbevf"
+CUSTOM_PACKAGES="$CUSTOM_PACKAGES kmod-fs-nfs kmod-fs-nfs-common kmod-fs-nfs-v3 kmod-fs-nfs-v4 kmod-mlx5-core kmod-ixgbe kmod-ixgbevf"
 
 # 2. 启用 OpenClash 及其依赖
 # (注: 源文件中已有此行，你也可以直接去上面取消那行的注释。这里为了方便统一写在一起)
