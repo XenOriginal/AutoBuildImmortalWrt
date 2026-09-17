@@ -98,7 +98,7 @@ jobs:
             gettext git java-propose-classpath libelf-dev libncurses5-dev \
             libncursesw5-dev libssl-dev python3 python3-distutils python3-setuptools \
             python3-dev rsync subversion swig time xsltproc zlib1g-dev unzip wget \
-            genisoimage libncurses-dev
+            genisoimage libncurses-dev default-jre-headless ca-certificates-java
 
       - name: Prepare host config and custom files
         run: |
@@ -157,6 +157,7 @@ jobs:
             -e PPPOE_ACCOUNT="$PPPOE_ACCOUNT" \
             -e PPPOE_PASSWORD="$PPPOE_PASSWORD" \
             -e IMM_BRANCH="$IMM_BRANCH" \
+            -e FORCE_UNSAFE_CONFIGURE=1 \
             -w /work \
             ubuntu:22.04 \
             /bin/bash -c '
@@ -168,7 +169,8 @@ jobs:
                 java-propose-classpath libelf-dev libncurses5-dev libncursesw5-dev \
                 libssl-dev python3 python3-distutils python3-setuptools python3-dev \
                 rsync subversion swig time xsltproc zlib1g-dev unzip wget sudo \
-                bzip2 gzip tar patch perl cpio bc rsync genisoimage libncurses-dev
+                bzip2 gzip tar patch perl cpio bc rsync genisoimage libncurses-dev \
+                default-jre-headless ca-certificates-java
               echo ">>> 依赖安装完成, 开始编译"
               bash /work/x86-64-host/build-source.sh
             '

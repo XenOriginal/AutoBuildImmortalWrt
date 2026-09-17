@@ -13,6 +13,10 @@
 # ============================================================================
 set -euo pipefail
 
+# GNU tar 等工具的 configure 会拒绝以 root 身份运行 (容器内是 root),
+# 必须显式跳过该检查, 否则 tools/tar 构建失败。
+export FORCE_UNSAFE_CONFIGURE=1
+
 SRC_DIR="/work/immortalwrt"
 REPO_URL="https://github.com/immortalwrt/immortalwrt.git"
 REPO_BRANCH="${IMM_BRANCH:-openwrt-25.12}"
