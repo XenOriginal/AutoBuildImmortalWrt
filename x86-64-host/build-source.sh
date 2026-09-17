@@ -68,29 +68,157 @@ cp -f /host-config/feeds.conf.default feeds.conf.default 2>/dev/null || true
 
 # ---------------------------------------------------------------------------
 # 4. 应用 .config
+#
+# 【关键教训 — run #5 失败原因】
+#   ImageBuilder 导出的 host.config 不能直接用于源码编译!
+#   它的内核符号不完整, 导致 Linux 内核回退到上游
+#   arch/x86/configs/x86_64_defconfig, 出现 3174 个全新符号,
+#   oldconfig 进入交互式提问并卡死:
+#       RFC 7919 FFDHE groups (CRYPTO_DH_RFC7919_GROUPS) [N/y/?] (NEW)
+#       make[8]: *** [scripts/kconfig/Makefile:85: syncconfig] Error 1
+#
+#   正确做法: 让 OpenWrt 自己生成目标基线配置 (它会合并
+#   target/linux/x86/config-6.12 与内核 KCONFIG 声明),
+#   再把我们的个性化选项叠加其上。
 # ---------------------------------------------------------------------------
-echo ">>> 应用内核/软件包配置..."
-cp -f /host-config/host.config .config
+echo ">>> 生成目标基线配置 (x86/64)..."
 
-# ---------------------------------------------------------------------------
-# 重要 —— 关于内核符号 CONFIG_CRYPTO_DEV_QAT_*
-#
-#   【不要】把内核符号直接追加到 .config!
-#   ImageBuilder 生成的 .config 不含内核源码树, make defconfig 会把这些
-#   "未知符号"当作垃圾清除。实测 (run #1): 追加 4 个内核符号 + 3 个包符号,
-#   defconfig 后内核符号【全部消失】, 只剩 3 个 CONFIG_PACKAGE_*。
-#
-#   正确做法: 内核符号由 KernelPackage 的 KCONFIG:= 字段声明, OpenWrt
-#   构建系统会在编译内核时自动写入并生效。见 qat-src/qat-kmod/Makefile。
-# ---------------------------------------------------------------------------
-# 仅追加【软件包】符号 (这些会被 defconfig 保留)
-cat >> .config <<'EOF'
+# 4.1 先写入最小 seed, 让 OpenWrt 生成完整的目标配置
+cat > .config <<'SEED'
+CONFIG_TARGET_x86=y
+CONFIG_TARGET_x86_64=y
+CONFIG_TARGET_SUBTARGET="64"
+CONFIG_TARGET_PROFILE="generic"
+CONFIG_TARGET_MULTI_PROFILE=y
+CONFIG_TARGET_DEVICE_x86_64_DEVICE_generic=y
+SEED
+
+make defconfig >>"$LOG" 2>&1
+
+# 4.2 叠加个性化选项
+echo ">>> 叠加宿主机个性化选项..."
+
+# ---- 版本信息 ----
+sed -i "/^CONFIG_VERSION_REPO=/d" .config
+echo 'CONFIG_VERSION_REPO="https://downloads.immortalwrt.org/releases/25.12.1"' >> .config
+
+# ---- 根文件系统大小 ----
+sed -i "/^CONFIG_TARGET_ROOTFS_PARTSIZE=/d" .config
+echo "CONFIG_TARGET_ROOTFS_PARTSIZE=${PROFILE}" >> .config
+
+# ---- 宿主机必备软件包 ----
+HOST_PKGS="
+CONFIG_PACKAGE_kmod-mlx5-core=y
+CONFIG_PACKAGE_kmod-mlxfw=y
+CONFIG_PACKAGE_kmod-ixgbe=y
+CONFIG_PACKAGE_kmod-ixgbevf=y
+CONFIG_PACKAGE_kmod-i40e=y
+CONFIG_PACKAGE_kmod-e1000e=y
+CONFIG_PACKAGE_kmod-r8125=y
+CONFIG_PACKAGE_kmod-tg3=y
+CONFIG_PACKAGE_kmod-vmxnet3=y
+CONFIG_PACKAGE_kmod-tun=y
+CONFIG_PACKAGE_kmod-inet-diag=y
+CONFIG_PACKAGE_kmod-nft-tproxy=y
+CONFIG_PACKAGE_kmod-nft-socket=y
+CONFIG_PACKAGE_kmod-zram=y
+CONFIG_PACKAGE_zram-swap=y
+CONFIG_PACKAGE_kmod-tcp-bbr=y
+CONFIG_PACKAGE_kmod-fs-nfs=y
+CONFIG_PACKAGE_kmod-fs-nfs-common=y
+CONFIG_PACKAGE_kmod-fs-nfs-v3=y
+CONFIG_PACKAGE_kmod-fs-nfs-v4=y
+CONFIG_PACKAGE_kmod-dnsresolver=y
+CONFIG_PACKAGE_kmod-fs-ext4=y
+CONFIG_PACKAGE_kmod-fs-f2fs=y
+CONFIG_PACKAGE_kmod-fs-vfat=y
+CONFIG_PACKAGE_kmod-fs-msdos=y
+CONFIG_PACKAGE_block-mount=y
+CONFIG_PACKAGE_automount=y
+CONFIG_PACKAGE_kmod-usb-storage=y
+CONFIG_PACKAGE_kmod-usb-storage-extras=y
+CONFIG_PACKAGE_kmod-usb-storage-uas=y
+CONFIG_PACKAGE_bash=y
+CONFIG_PACKAGE_curl=y
+CONFIG_PACKAGE_unzip=y
+CONFIG_PACKAGE_git=y
+CONFIG_PACKAGE_ip-full=y
+CONFIG_PACKAGE_ipset=y
+CONFIG_PACKAGE_ethtool-full=y
+CONFIG_PACKAGE_dmidecode=y
+CONFIG_PACKAGE_smartmontools=y
+CONFIG_PACKAGE_lm-sensors=y
+CONFIG_PACKAGE_sysfsutils=y
+CONFIG_PACKAGE_lsblk=y
+CONFIG_PACKAGE_fdisk=y
+CONFIG_PACKAGE_parted=y
+CONFIG_PACKAGE_partx-utils=y
+CONFIG_PACKAGE_blkid=y
+CONFIG_PACKAGE_e2fsprogs=y
+CONFIG_PACKAGE_dosfstools=y
+CONFIG_PACKAGE_mkf2fs=y
+CONFIG_PACKAGE_openssh-sftp-server=y
+CONFIG_PACKAGE_make=y
+CONFIG_PACKAGE_tini=y
+CONFIG_PACKAGE_conntrack=y
+CONFIG_PACKAGE_iperf3=y
+CONFIG_PACKAGE_jq=y
+CONFIG_PACKAGE_openssl-util=y
+CONFIG_PACKAGE_rsync=y
+CONFIG_PACKAGE_htop=y
+CONFIG_PACKAGE_iftop=y
+CONFIG_PACKAGE_nload=y
+CONFIG_PACKAGE_ncdu=y
+CONFIG_PACKAGE_tmux=y
+CONFIG_PACKAGE_nano=y
+CONFIG_PACKAGE_vim-full=y
+CONFIG_PACKAGE_lsof=y
+CONFIG_PACKAGE_pciutils=y
+CONFIG_PACKAGE_usbutils=y
+CONFIG_PACKAGE_ttyd=y
+CONFIG_PACKAGE_dnsmasq-full=y
+CONFIG_PACKAGE_odhcp6c=y
+CONFIG_PACKAGE_odhcpd-ipv6only=y
+CONFIG_PACKAGE_luci-base=y
+CONFIG_PACKAGE_luci-compat=y
+CONFIG_PACKAGE_luci-theme-argon=y
+CONFIG_PACKAGE_luci-app-argon-config=y
+CONFIG_PACKAGE_luci-i18n-argon-config-zh-cn=y
+CONFIG_PACKAGE_luci-i18n-base-zh-cn=y
+CONFIG_PACKAGE_luci-i18n-firewall-zh-cn=y
+CONFIG_PACKAGE_luci-i18n-package-manager-zh-cn=y
+CONFIG_PACKAGE_luci-i18n-ttyd-zh-cn=y
+CONFIG_PACKAGE_luci-app-diskman=y
+CONFIG_PACKAGE_luci-i18n-diskman-zh-cn=y
+CONFIG_PACKAGE_luci-app-filemanager=y
+CONFIG_PACKAGE_luci-i18n-filemanager-zh-cn=y
+CONFIG_PACKAGE_luci-proto-ipv6=y
+CONFIG_PACKAGE_luci-proto-ppp=y
+"
+
+# ---- QAT 软件包 (内核符号由 KCONFIG 声明) ----
+HOST_PKGS="$HOST_PKGS
 CONFIG_PACKAGE_kmod-crypto-qat-common=m
 CONFIG_PACKAGE_kmod-crypto-qat-dh895xcc=m
 CONFIG_PACKAGE_qat-firmware-dh895xcc=m
-EOF
+"
 
-# 自动接受新增符号的默认值
+# ---- Docker (可选) ----
+if [ "$INCLUDE_DOCKER" = "yes" ]; then
+    HOST_PKGS="$HOST_PKGS
+CONFIG_PACKAGE_dockerd=y
+CONFIG_PACKAGE_docker=y
+CONFIG_PACKAGE_docker-compose=y
+CONFIG_PACKAGE_containerd=y
+CONFIG_PACKAGE_runc=y
+CONFIG_PACKAGE_luci-app-dockerman=y
+CONFIG_PACKAGE_luci-i18n-dockerman-zh-cn=y
+"
+    echo ">>> Docker 已启用"
+fi
+
+# 写入并让 OpenWrt 解析依赖
+echo "$HOST_PKGS" >> .config
 make defconfig >>"$LOG" 2>&1
 
 echo "--- QAT 相关最终配置 (软件包层) ---"
@@ -162,28 +290,22 @@ fi
 
 # ---------------------------------------------------------------------------
 # 6. 编译
+#    (ROOTFS_PARTSIZE 与 Docker 已在第 4 节写入并经 defconfig 解析)
 # ---------------------------------------------------------------------------
-# 注入根文件系统分区大小 (对应工作流的 profile 输入)
-sed -i "/^CONFIG_TARGET_ROOTFS_PARTSIZE=/d" .config
-echo "CONFIG_TARGET_ROOTFS_PARTSIZE=${PROFILE}" >> .config
-
-# 注入 Docker 开关
-if [ "$INCLUDE_DOCKER" = "yes" ]; then
-    for p in CONFIG_PACKAGE_dockerd CONFIG_PACKAGE_docker CONFIG_PACKAGE_docker-compose \
-             CONFIG_PACKAGE_containerd CONFIG_PACKAGE_runc \
-             CONFIG_PACKAGE_luci-app-dockerman CONFIG_PACKAGE_luci-i18n-dockerman-zh-cn; do
-        sed -i "/^${p}=/d" .config
-        echo "${p}=y" >> .config
-    done
-    echo ">>> Docker 已启用"
-fi
-
-make defconfig >>"$LOG" 2>&1
-
-echo ">>> ROOTFS_PARTSIZE = $(grep '^CONFIG_TARGET_ROOTFS_PARTSIZE=' .config | cut -d= -f2)"
+echo ">>> 编译前配置确认:"
+echo "    ROOTFS_PARTSIZE = $(grep '^CONFIG_TARGET_ROOTFS_PARTSIZE=' .config | cut -d= -f2)"
+echo "    QAT 包数量      = $(grep -c '^CONFIG_PACKAGE_.*qat' .config)"
+echo "    .config 总行数  = $(wc -l < .config)"
 
 echo ">>> 开始编译 (日志: $LOG)..."
-if ! make -j"$(nproc)" V=s 2>&1 | tee -a "$LOG"; then
+# KCONFIG_NOSILENTUPDATE: 内核配置出现新符号时不要静默重启配置
+# 关键: 必须让 make 以非交互方式运行, 否则 kconfig 遇到 (NEW) 符号会
+#       停在提示符等待输入, 表现为长时间无输出后 syncconfig 报错。
+export KCONFIG_NOSILENTUPDATE=1
+export CI=1
+export DEBIAN_FRONTEND=noninteractive
+
+if ! make -j"$(nproc)" V=s </dev/null 2>&1 | tee -a "$LOG"; then
     echo "!!! 编译失败, 最后 150 行日志:"
     tail -150 "$LOG"
     exit 1
