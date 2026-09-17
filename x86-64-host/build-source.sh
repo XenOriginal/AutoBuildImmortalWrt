@@ -298,13 +298,19 @@ echo "    QAT 包数量      = $(grep -c '^CONFIG_PACKAGE_.*qat' .config)"
 echo "    .config 总行数  = $(wc -l < .config)"
 
 echo ">>> 开始编译 (日志: $LOG)..."
-# KCONFIG_NOSILENTUPDATE: 内核配置出现新符号时不要静默重启配置
-# 关键: 必须让 make 以非交互方式运行, 否则 kconfig 遇到 (NEW) 符号会
-#       停在提示符等待输入, 表现为长时间无输出后 syncconfig 报错。
-export KCONFIG_NOSILENTUPDATE=1
+#
+# 【关键教训 — run #6 失败原因】
+#   不要设置 KCONFIG_NOSILENTUPDATE=1 !
+#   该变量会让内核 syncconfig 在遇到新符号时直接报错退出:
+#       *** The configuration requires explicit update.
+#       make[8]: *** [scripts/kconfig/Makefile:85: syncconfig] Error 1
+#   OpenWrt 自身已用 `yes '' | make oldconfig` 自动应答新符号,
+#   不应再叠加此限制。
+#
 export CI=1
 export DEBIAN_FRONTEND=noninteractive
 
+# stdin 接 /dev/null: 防止任何残留提示无限等待输入
 if ! make -j"$(nproc)" V=s </dev/null 2>&1 | tee -a "$LOG"; then
     echo "!!! 编译失败, 最后 150 行日志:"
     tail -150 "$LOG"
