@@ -116,9 +116,17 @@ grep -E "CONFIG_CRYPTO_DEV_QAT_DH895" package/qat/qat-kmod/Makefile
 
 # ---------------------------------------------------------------------------
 # 5. 下载源码包
+#    【注意】日志必须同时打到 stdout, 否则容器销毁后无法排错。
 # ---------------------------------------------------------------------------
 echo ">>> 下载依赖源码 (多线程)..."
-make download -j"$(nproc)" >>"$LOG" 2>&1 || make download -j1 V=s >>"$LOG" 2>&1
+if ! make download -j"$(nproc)" 2>&1 | tee -a "$LOG"; then
+    echo ">>> 多线程下载失败, 改用单线程 + 详细输出重试..."
+    if ! make download -j1 V=s 2>&1 | tee -a "$LOG"; then
+        echo "!!! 下载依赖失败, 最后 60 行:"
+        tail -60 "$LOG"
+        exit 1
+    fi
+fi
 
 # ---------------------------------------------------------------------------
 # 6. 编译
@@ -143,11 +151,11 @@ make defconfig >>"$LOG" 2>&1
 echo ">>> ROOTFS_PARTSIZE = $(grep '^CONFIG_TARGET_ROOTFS_PARTSIZE=' .config | cut -d= -f2)"
 
 echo ">>> 开始编译 (日志: $LOG)..."
-make -j"$(nproc)" V=s >>"$LOG" 2>&1 || {
+if ! make -j"$(nproc)" V=s 2>&1 | tee -a "$LOG"; then
     echo "!!! 编译失败, 最后 150 行日志:"
     tail -150 "$LOG"
     exit 1
-}
+fi
 
 # ---------------------------------------------------------------------------
 # 7. 产物
