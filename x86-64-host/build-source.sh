@@ -115,6 +115,34 @@ echo "--- 确认内核符号已由 KCONFIG 声明 ---"
 grep -E "CONFIG_CRYPTO_DEV_QAT_DH895" package/qat/qat-kmod/Makefile
 
 # ---------------------------------------------------------------------------
+# 4.5 预检: 确认必需的系统依赖齐全
+#     (OpenWrt 的 prereq 检查会把 mkisofs 等缺失当作普通 make 错误,
+#      信息藏在 make[6] 深层输出里, 故此处提前显式检查)
+# ---------------------------------------------------------------------------
+echo ">>> 预检系统依赖..."
+MISSING_DEPS=""
+for cmd in gcc g++ make perl python3 rsync unzip wget git file \
+           mkisofs genisoimage bzip2 tar patch cpio bc; do
+    if ! command -v "$cmd" >/dev/null 2>&1; then
+        # mkisofs 与 genisoimage 任一存在即可
+        case "$cmd" in
+            mkisofs)
+                command -v genisoimage >/dev/null 2>&1 || MISSING_DEPS="$MISSING_DEPS $cmd" ;;
+            genisoimage)
+                command -v mkisofs >/dev/null 2>&1 || MISSING_DEPS="$MISSING_DEPS $cmd" ;;
+            *)
+                MISSING_DEPS="$MISSING_DEPS $cmd" ;;
+        esac
+    fi
+done
+if [ -n "$MISSING_DEPS" ]; then
+    echo "!!! 缺失必需的系统依赖:$MISSING_DEPS"
+    echo "!!! Ubuntu 22.04 请执行: apt-get install -y genisoimage build-essential ..."
+    exit 1
+fi
+echo "  OK: 系统依赖齐全"
+
+# ---------------------------------------------------------------------------
 # 5. 下载源码包
 #    【注意】日志必须同时打到 stdout, 否则容器销毁后无法排错。
 # ---------------------------------------------------------------------------
