@@ -22,9 +22,9 @@ on:
         required: true
         default: "10.0.0.1"
       profile:
-        description: '固件大小 单位(MB)  (宿主机 overlay 约 906M, 建议 2048)'
+        description: '固件大小 单位(MB) — Web端升级不改动已有分区, 保持默认即可'
         required: true
-        default: '2048'
+        default: '1024'
       include_docker:
         description: "是否编译 Docker 插件 (宿主机运行 deepseek-harness 等容器)"
         required: true

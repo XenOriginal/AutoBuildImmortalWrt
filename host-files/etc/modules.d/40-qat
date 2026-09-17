@@ -1,0 +1,6 @@
+# Intel QAT DH895XCC 加速卡驱动
+# 硬件: 0000:01:00.0 vendor=0x8086 device=0x19e2 (DH895XCC QAT)
+# 加载顺序: intel_qat (公共层) -> qat_dh895xcc (主体) -> qat_dh895xccvf (SR-IOV VF)
+# 固件: /lib/firmware/qat_895xcc.bin + qat_895xcc_mmp.bin
+intel_qat
+qat_dh895xcc

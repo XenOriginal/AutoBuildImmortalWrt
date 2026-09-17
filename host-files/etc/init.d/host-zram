@@ -1,0 +1,51 @@
+#!/bin/sh
+# ============================================================================
+# zram swap 初始化  ——  宿主机内存压缩
+#
+# 背景: 本机 7.6G 物理内存, 需 zram 压缩内存补充。
+#       实测 /dev/zram0 约 3.8G, 已用 1.3G。
+#       配合 vm.swappiness=150 (见 /etc/sysctl.conf) 优先换出匿名页。
+#
+# zram-swap 包自带的 /etc/init.d/zram 已处理大部分逻辑,
+# 此处仅确保 zram 大小为内存的 50% 并启用多线程压缩。
+# ============================================================================
+START=15
+
+start() {
+    # 若 zram 已由 zram-swap 包初始化, 不再重复处理
+    if [ -e /dev/zram0 ] && grep -q zram /proc/swaps; then
+        logger -t host-zram "zram swap already active, skipping"
+        return 0
+    fi
+
+    # 计算 zram 大小: 物理内存的 50%
+    mem_kb=$(awk '/MemTotal/{print $2}' /proc/meminfo)
+    zram_mb=$(( mem_kb / 1024 / 2 ))
+
+    # 优先使用 lz4 (x86 上解压最快), 退而求其次 lzo-rle
+    if grep -qw lz4 /sys/block/zram0/comp_algorithm 2>/dev/null; then
+        algo=lz4
+    elif grep -qw lzo-rle /sys/block/zram0/comp_algorithm 2>/dev/null; then
+        algo=lzo-rle
+    else
+        algo=lzo
+    fi
+
+    modprobe zram num_devices=1 2>/dev/null
+    echo "$algo" > /sys/block/zram0/comp_algorithm 2>/dev/null
+    echo "${zram_mb}M" > /sys/block/zram0/disksize 2>/dev/null
+    mkswap /dev/zram0 >/dev/null 2>&1
+    swapon -p 100 /dev/zram0 2>/dev/null
+
+    logger -t host-zram "zram0 initialized: ${zram_mb}MB, algo=$algo"
+}
+
+stop() {
+    swapoff /dev/zram0 2>/dev/null
+}
+
+case "$1" in
+    start) start ;;
+    stop)  stop ;;
+    *)     echo "usage: $0 {start|stop}" ;;
+esac

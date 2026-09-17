@@ -127,7 +127,9 @@ else
 fi
 
 # ===== 3.6 网络存储: NFS 客户端 (挂载 10.0.0.10 的三处共享) =====
-PACKAGES="$PACKAGES nfs-utils"
+# 说明: 宿主机实测 /proc/filesystems 显示 nfs/nfs4 已编入内核,
+#       rc.local 直接用 `mount -t nfs` 即可挂载, 无需 nfs-utils/rpcbind。
+#       故此处【不】引入 nfs-utils (避免多余依赖), 仅保留内核 NFS 模块。
 PACKAGES="$PACKAGES kmod-fs-nfs"
 PACKAGES="$PACKAGES kmod-fs-nfs-common"
 PACKAGES="$PACKAGES kmod-fs-nfs-v3"

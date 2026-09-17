@@ -1,0 +1,197 @@
+name: Build 25.12.x x86-64 Host SOURCE (QAT enabled)
+
+# ============================================================================
+# 宿主机专属固件 —— 源码编译版 (启用 Intel QAT 硬件加速)
+#
+# 为什么需要源码编译:
+#   ImageBuilder 只能安装官方 feed 中【已有】的二进制包。
+#   实测 ImmortalWrt 25.12.1 的 kmods feed 共 1199 个包, 其中【无任何 QAT 相关项】,
+#   且上游 target/linux/generic/config-6.12 中 CONFIG_CRYPTO_DEV_QAT_* 全部为
+#   "is not set"。因此 QAT 驱动必须通过源码编译启用。
+#
+# 本机 QAT 硬件:
+#   0000:01:00.0  vendor=0x8086  device=0x19e2  class=0x0b4000
+#   = Intel DH895XCC QuickAssist 协处理器 (当前无驱动绑定)
+#
+# 同时固化宿主机的手动调优:
+#   - BBR / TCP 缓冲放大 / TFO
+#   - dirty_writeback 限制 + swappiness=150 (配合 zram)
+# ============================================================================
+on:
+  workflow_dispatch:
+    inputs:
+      imm_branch:
+        description: "ImmortalWrt 源码分支"
+        required: true
+        default: "openwrt-25.12"
+        type: choice
+        options:
+          - openwrt-25.12
+          - openwrt-24.10
+      custom_router_ip:
+        description: "路由器管理地址"
+        required: true
+        default: "10.0.0.1"
+      profile:
+        description: '固件大小 单位(MB) — Web端升级不改动已有分区, 保持默认即可'
+        required: true
+        default: '1024'
+      include_docker:
+        description: "是否编译 Docker 插件"
+        required: true
+        default: 'yes'
+        type: choice
+        options:
+          - 'yes'
+          - 'no'
+      enable_pppoe:
+        description: "是否配置PPPoE拨号信息?"
+        required: true
+        default: 'no'
+        type: choice
+        options:
+          - 'yes'
+          - 'no'
+      pppoe_account:
+        description: "宽带账号 (若启用PPPoE)"
+        required: false
+      pppoe_password:
+        description: "宽带密码 (若启用PPPoE)"
+        required: false
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 350
+
+    steps:
+      - name: Checkout build repo
+        uses: actions/checkout@v6
+
+      # ---------------------------------------------------------------------
+      # 释放 runner 磁盘空间 —— 源码编译需要约 30-50GB, 而默认仅 ~14GB 可用
+      # ---------------------------------------------------------------------
+      - name: Free up disk space
+        run: |
+          echo "=== 清理前 ==="
+          df -h /
+          sudo rm -rf /usr/share/dotnet            || true
+          sudo rm -rf /usr/local/lib/android       || true
+          sudo rm -rf /opt/ghc                     || true
+          sudo rm -rf /opt/hostedtoolcache/CodeQL  || true
+          sudo rm -rf /usr/local/share/boost       || true
+          sudo rm -rf "$AGENT_TOOLSDIRECTORY"      || true
+          sudo apt-get clean
+          # 构建目录放到 /mnt (runner 上通常为更大的临时盘)
+          sudo mkdir -p /mnt/build && sudo chown -R "$USER":"$USER" /mnt/build
+          echo "=== 清理后 ==="
+          df -h / /mnt
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq \
+            build-essential ccache ecj fastjar file g++ gawk \
+            gettext git java-propose-classpath libelf-dev libncurses5-dev \
+            libncursesw5-dev libssl-dev python3 python3-distutils python3-setuptools \
+            python3-dev rsync subversion swig time xsltproc zlib1g-dev unzip wget
+
+      - name: Prepare host config and custom files
+        run: |
+          set -e
+          mkdir -p /mnt/build
+          echo "${{ github.event.inputs.custom_router_ip }}" > custom_router_ip.txt
+          echo "管理地址: ${{ github.event.inputs.custom_router_ip }}"
+
+          # uci-defaults (首次启动脚本)
+          mkdir -p files/etc/uci-defaults
+          cp x86-64-host/99-host.sh files/etc/uci-defaults/99-host.sh
+          chmod +x files/etc/uci-defaults/99-host.sh
+
+          # 宿主机调优文件 (sysctl.conf / modules.d / init.d) 合并进 files/
+          cp -r host-files/etc/* files/etc/
+          chmod +x files/etc/init.d/host-zram
+          echo "--- files/ 内容 ---"
+          find files -type f | sort
+
+          # 管理地址注入
+          mkdir -p files/etc/config
+          cp custom_router_ip.txt files/etc/config/custom_router_ip.txt
+
+      - name: Validate PPPoE inputs
+        run: |
+          if [[ "${{ inputs.enable_pppoe }}" == "yes" ]]; then
+            if [[ -z "${{ inputs.pppoe_account }}" || -z "${{ inputs.pppoe_password }}" ]]; then
+              echo "::error::启用 PPPoE 时必须填写账号与密码"
+              exit 1
+            fi
+          fi
+
+      - name: Build firmware from source (with QAT)
+        env:
+          IMM_BRANCH: ${{ github.event.inputs.imm_branch }}
+          PROFILE: ${{ github.event.inputs.profile }}
+          INCLUDE_DOCKER: ${{ github.event.inputs.include_docker }}
+          ENABLE_PPPOE: ${{ inputs.enable_pppoe }}
+          PPPOE_ACCOUNT: ${{ inputs.pppoe_account }}
+          PPPOE_PASSWORD: ${{ inputs.pppoe_password }}
+        run: |
+          set -e
+          chmod +x x86-64-host/build-source.sh
+
+          # 以容器方式运行编译, 保证环境一致
+          docker run --rm \
+            --user root \
+            --privileged \
+            -v "$PWD:/work" \
+            -v "$PWD/x86-64-host/source-config:/host-config:ro" \
+            -v "$PWD/qat-src:/host-qat:ro" \
+            -v "$PWD/files:/host-files:ro" \
+            -e PROFILE="$PROFILE" \
+            -e INCLUDE_DOCKER="$INCLUDE_DOCKER" \
+            -e ENABLE_PPPOE="$ENABLE_PPPOE" \
+            -e PPPOE_ACCOUNT="$PPPOE_ACCOUNT" \
+            -e PPPOE_PASSWORD="$PPPOE_PASSWORD" \
+            -e IMM_BRANCH="$IMM_BRANCH" \
+            -w /work \
+            ubuntu:22.04 \
+            /bin/bash -c '
+              set -e
+              echo ">>> 容器内安装编译依赖..."
+              apt-get update -qq
+              DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
+                build-essential ccache ecj fastjar file g++ gawk gettext git \
+                java-propose-classpath libelf-dev libncurses5-dev libncursesw5-dev \
+                libssl-dev python3 python3-distutils python3-setuptools python3-dev \
+                rsync subversion swig time xsltproc zlib1g-dev unzip wget sudo \
+                bzip2 gzip tar patch perl cpio bc rsync
+              echo ">>> 依赖安装完成, 开始编译"
+              bash /work/x86-64-host/build-source.sh
+            '
+
+      - name: Verify QAT and tuning in output
+        run: |
+          echo "=== 构建产物 ==="
+          ls -lah bin/targets/x86/64/ 2>/dev/null || true
+          echo
+          echo "=== QAT 相关文件 ==="
+          find bin/ -iname "*qat*" 2>/dev/null || echo "(未找到)"
+          echo
+          echo "=== 内核模块包 ==="
+          ls -la bin/targets/x86/64/kmods/*/ 2>/dev/null | grep -i qat || echo "(kmods 中未找到 qat)"
+
+      - name: Upload firmware
+        uses: actions/upload-artifact@v4
+        with:
+          name: ImmortalWrt-x86-64-Host-QAT-source
+          path: |
+            bin/targets/x86/64/*.img.gz
+            bin/targets/x86/64/*.squashfs-combined*
+            bin/targets/x86/64/*.manifest
+            bin/targets/x86/64/sha256sums
+            bin/targets/x86/64/kmods/**/*qat*
+          if-no-files-found: warn
+          retention-days: 30
