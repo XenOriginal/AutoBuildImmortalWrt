@@ -201,6 +201,9 @@ HOST_PKGS="$HOST_PKGS
 CONFIG_PACKAGE_kmod-crypto-qat-common=m
 CONFIG_PACKAGE_kmod-crypto-qat-dh895xcc=m
 CONFIG_PACKAGE_qat-firmware-dh895xcc=m
+CONFIG_KERNEL_CRYPTO_DH=y
+CONFIG_KERNEL_CRYPTO_DH_RFC7919_GROUPS=y
+CONFIG_KERNEL_CRYPTO_RSA=y
 "
 
 # ---- Docker (可选) ----
@@ -296,6 +299,42 @@ echo ">>> 编译前配置确认:"
 echo "    ROOTFS_PARTSIZE = $(grep '^CONFIG_TARGET_ROOTFS_PARTSIZE=' .config | cut -d= -f2)"
 echo "    QAT 包数量      = $(grep -c '^CONFIG_PACKAGE_.*qat' .config)"
 echo "    .config 总行数  = $(wc -l < .config)"
+
+# ---------------------------------------------------------------------------
+# 5.5 预生成内核 .config, 避免 syncconfig 在编译期遇到 (NEW) 符号
+#
+# 【run #7 失败根因】
+#   最终内核阶段直接执行 `make bzImage modules`, 该命令内部会触发
+#   syncconfig。若此时存在尚未回答的新符号 (如 CRYPTO_DH_RFC7919_GROUPS),
+#   kconfig 会打印 `[N/y/?] (NEW)` 并读取 stdin; 而我们的 stdin 是
+#   /dev/null, 立即 EOF, 于是:
+#       RFC 7919 FFDHE groups (CRYPTO_DH_RFC7919_GROUPS) [N/y/?] (NEW)
+#       make[8]: *** [scripts/kconfig/Makefile:85: syncconfig] Error 1
+#
+#   对比: 工具链内核阶段之所以成功, 是因为 OpenWrt 显式使用了
+#   `yes '' | make oldconfig` 自动应答。
+#
+#   解法: 在正式编译前, 先对目标内核执行一次 `yes '' | make oldconfig`,
+#         把所有 (NEW) 符号一次性落盘到 .config。此后 syncconfig 无事可做。
+# ---------------------------------------------------------------------------
+KERNEL_BUILD_DIR="$SRC_DIR/build_dir/target-x86_64_musl/linux-x86_64"
+echo ">>> 预热内核配置 (消除残留的 NEW 符号)..."
+if [ -d "$KERNEL_BUILD_DIR" ]; then
+    KDIR=$(find "$KERNEL_BUILD_DIR" -maxdepth 1 -type d -name "linux-*" | head -1)
+    if [ -n "$KDIR" ] && [ -d "$KDIR" ]; then
+        echo "    目标内核目录: $KDIR"
+        # 先执行 prepare 让 OpenWrt 生成 .config.set
+        make target/linux/prepare V=s >>"$LOG" 2>&1 || true
+        if [ -f "$KDIR/.config" ] || [ -f "$KDIR/.config.set" ]; then
+            ( cd "$KDIR" && yes '' | make ARCH=x86 oldconfig >>"$LOG" 2>&1 ) || true
+            echo "    oldconfig 完成, (NEW) 符号已落盘"
+        else
+            echo "    (跳过: 内核 .config 尚未生成)"
+        fi
+    fi
+else
+    echo "    (跳过: 内核 build_dir 尚不存在)"
+fi
 
 echo ">>> 开始编译 (日志: $LOG)..."
 #
