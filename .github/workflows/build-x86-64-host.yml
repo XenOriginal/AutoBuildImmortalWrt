@@ -1,0 +1,152 @@
+name: Build 25.12.x x86-64 Host (Inspur AliMoC-MD-02-25G)
+
+# ============================================================================
+# 宿主机专属固件构建  ——  Inspur AliMoC-MD-02-25G
+# 网卡: mlx5_core (ConnectX) x2 + ixgbe (Intel X550/X540) x1
+# 用途: 软路由 + Docker 宿主 + OpenClash + NFS 客户端
+# 基线: 宿主机当前运行的 ImmortalWrt 25.12.0-rc1 (r37654)
+# ============================================================================
+on:
+  workflow_dispatch:
+    inputs:
+      luci_version:
+        description: "选择luci版本"
+        required: false
+        default: "25.12.1"
+        type: choice
+        options:
+          - 25.12.0
+          - 25.12.1
+      custom_router_ip:
+        description: "路由器管理地址 (宿主机当前为 10.0.0.1)"
+        required: true
+        default: "10.0.0.1"
+      profile:
+        description: '固件大小 单位(MB)  (宿主机 overlay 约 906M, 建议 2048)'
+        required: true
+        default: '2048'
+      include_docker:
+        description: "是否编译 Docker 插件 (宿主机运行 deepseek-harness 等容器)"
+        required: true
+        default: 'yes'
+        type: choice
+        options:
+          - 'yes'
+          - 'no'
+      enable_pppoe:
+        description: "是否配置PPPoE拨号信息?"
+        required: true
+        default: 'no'
+        type: choice
+        options:
+          - 'yes'
+          - 'no'
+      pppoe_account:
+        description: "宽带账号 (若启用PPPoE)"
+        required: false
+      pppoe_password:
+        description: "宽带密码 (若启用PPPoE)"
+        required: false
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+
+      - name: Set executable permissions
+        run: |
+          chmod +x ${{ github.workspace }}/x86-64-host/build.sh
+          chmod +x ${{ github.workspace }}/x86-64-host/99-host.sh
+
+      - name: Save Custom Router IP and host defaults
+        run: |
+          mkdir -p "${{ github.workspace }}/custom"
+          echo "${{ github.event.inputs.custom_router_ip }}" > "${{ github.workspace }}/custom/custom_router_ip.txt"
+          echo "路由器管理地址: ${{ github.event.inputs.custom_router_ip }}"
+
+          # 宿主机专属 uci-defaults 脚本 -> files/etc/uci-defaults/
+          mkdir -p "${{ github.workspace }}/files/etc/uci-defaults"
+          cp "${{ github.workspace }}/x86-64-host/99-host.sh" \
+             "${{ github.workspace }}/files/etc/uci-defaults/99-host.sh"
+          chmod +x "${{ github.workspace }}/files/etc/uci-defaults/99-host.sh"
+          ls -la "${{ github.workspace }}/files/etc/uci-defaults/"
+
+      - name: Validate PPPoE Inputs
+        run: |
+          if [[ "${{ inputs.enable_pppoe }}" == "yes" ]]; then
+            if [[ -z "${{ inputs.pppoe_account }}" || -z "${{ inputs.pppoe_password }}" ]]; then
+              echo "::error::启用 PPPoE 时必须填写账号和密码"
+              exit 1
+            fi
+          fi
+
+      - name: Build ImmortalWrt x86-64 Host
+        run: |
+          profile="${{ github.event.inputs.profile }}"
+          include_docker="${{ github.event.inputs.include_docker }}"
+          luci_version="${{ github.event.inputs.luci_version }}"
+          echo "=========================================="
+          echo " 构建宿主机固件"
+          echo " 固件大小 : ${profile} MB"
+          echo " Docker   : ${include_docker}"
+          echo " Luci版本 : ${luci_version}"
+          echo "=========================================="
+          docker run --rm -i \
+            --user root \
+            -v "${{ github.workspace }}/bin:/home/build/immortalwrt/bin" \
+            -v "${{ github.workspace }}/files:/home/build/immortalwrt/files" \
+            -v "${{ github.workspace }}/custom:/home/build/immortalwrt/files/etc/config" \
+            -v "${{ github.workspace }}/x86-64-host/imm25.config:/home/build/immortalwrt/.config" \
+            -v "${{ github.workspace }}/shell:/home/build/immortalwrt/shell" \
+            -v "${{ github.workspace }}/x86-64-host/build.sh:/home/build/immortalwrt/build.sh" \
+            -e PROFILE=$profile \
+            -e INCLUDE_DOCKER=$include_docker \
+            -e ENABLE_PPPOE=${{ inputs.enable_pppoe }} \
+            -e PPPOE_ACCOUNT=${{ inputs.pppoe_account }} \
+            -e PPPOE_PASSWORD=${{ inputs.pppoe_password }} \
+          immortalwrt/imagebuilder:x86-64-openwrt-${luci_version} /bin/bash /home/build/immortalwrt/build.sh
+
+      - name: Create info
+        run: |
+          cat > ${{ github.workspace }}/router-info.md <<EOF
+          ## 📡 宿主机固件信息 (Inspur AliMoC-MD-02-25G)
+
+          | 项目 | 值 |
+          |------|-----|
+          | 管理地址 | ${{ github.event.inputs.custom_router_ip }} |
+          | 用户名 | root |
+          | 密码 | 无 |
+          | 固件大小 | ${{ github.event.inputs.profile }} MB |
+          | Docker | ${{ github.event.inputs.include_docker }} |
+          | Luci版本 | ${{ github.event.inputs.luci_version }} |
+          | 网卡驱动 | mlx5_core + ixgbe |
+
+          ### 刷机方式
+          使用 \`sysupgrade -v <固件名>\` 保留配置升级, 或 Web 界面 系统->备份/升级 上传固件。
+          EOF
+          cat ${{ github.workspace }}/router-info.md
+
+      - name: List build outputs
+        run: |
+          echo "=== 构建产物 ==="
+          ls -lah ${{ github.workspace }}/bin/targets/x86/64/ || true
+
+      - name: Upload firmware artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: ImmortalWrt-x86-64-Host-AliMoC-MD-02-25G
+          path: |
+            ${{ github.workspace }}/bin/targets/x86/64/*.img.gz
+            ${{ github.workspace }}/bin/targets/x86/64/*.efi.img.gz
+            ${{ github.workspace }}/bin/targets/x86/64/*.squashfs-combined*
+            ${{ github.workspace }}/bin/targets/x86/64/*.manifest
+            ${{ github.workspace }}/bin/targets/x86/64/sha256sums
+            ${{ github.workspace }}/router-info.md
+          if-no-files-found: warn
+          retention-days: 30
