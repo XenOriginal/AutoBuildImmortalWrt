@@ -104,20 +104,26 @@ jobs:
       - name: "Step 2/3: yes '' | make oldconfig"
         run: |
           cd /tmp/imm
-          KDIR=$(find build_dir/target-x86_64_musl/linux-x86_64 -maxdepth 1 -type d -name "linux-*" 2>/dev/null | head -1)
+          KDIR=$(find build_dir/target-x86_64_musl/linux-x86_64 -maxdepth 2 -type d -name "linux-6.*" 2>/dev/null | head -1)
           if [ -z "$KDIR" ]; then
             echo "::error::未找到目标内核目录"
             find build_dir -maxdepth 4 -type d -name "linux-*" | head
             exit 1
           fi
           echo "内核目录: $KDIR"
+          # 校验确实是内核源码树 (含顶层 Makefile)
+          if [ ! -f "$KDIR/Makefile" ]; then
+            echo "::error::目录不是内核源码树 (无 Makefile): $KDIR"
+            ls -la "$KDIR" | head
+            exit 1
+          fi
           cd "$KDIR"
           yes '' | make ARCH=x86 oldconfig 2>&1 | tail -25
 
       - name: "Step 3/3: verify syncconfig non-interactive"
         run: |
           cd /tmp/imm
-          KDIR=$(find build_dir/target-x86_64_musl/linux-x86_64 -maxdepth 1 -type d -name "linux-*" 2>/dev/null | head -1)
+          KDIR=$(find build_dir/target-x86_64_musl/linux-x86_64 -maxdepth 2 -type d -name "linux-6.*" 2>/dev/null | head -1)
           cd "$KDIR"
 
           echo "=== 尝试非交互 syncconfig ==="

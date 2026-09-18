@@ -376,12 +376,19 @@ echo "    prepare 完成"
 
 # 定位目标内核目录 (target 用, 不是 toolchain 用)
 TARGET_KERNEL_BASE="$SRC_DIR/build_dir/target-x86_64_musl/linux-x86_64"
-KDIR=$(find "$TARGET_KERNEL_BASE" -maxdepth 1 -type d -name "linux-*" 2>/dev/null | head -1)
+# 注意: 基目录名 linux-x86_64 本身也匹配 "linux-*", 故必须用 maxdepth 2
+# 且匹配 "linux-6.*" 才能定位到真正的内核源码树
+KDIR=$(find "$TARGET_KERNEL_BASE" -maxdepth 2 -type d -name "linux-6.*" 2>/dev/null | head -1)
 
 if [ -z "$KDIR" ] || [ ! -d "$KDIR" ]; then
     echo "!!! 未找到目标内核目录: $TARGET_KERNEL_BASE"
     echo "--- 调试: build_dir 结构 ---"
     find "$SRC_DIR/build_dir" -maxdepth 3 -type d -name "linux-*" 2>/dev/null | head
+    exit 1
+fi
+if [ ! -f "$KDIR/Makefile" ]; then
+    echo "!!! 目录不是内核源码树 (无 Makefile): $KDIR"
+    ls -la "$KDIR" | head
     exit 1
 fi
 echo "    内核目录: $KDIR"
