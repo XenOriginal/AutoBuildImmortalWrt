@@ -320,8 +320,18 @@ echo "    .config 总行数  = $(wc -l < .config)"
 echo ">>> 注入内核符号以消除 (NEW) 提示..."
 # 这些是"依赖型"符号: 本身不显眼, 但当其依赖项被拉成 =m 时会变成
 # 全新可见符号, 迫使 kconfig 提问, 在非交互环境下直接失败。
+#
+# 已确认会触发的符号 (从 run#9 日志):
+#   CRYPTO_DEV_QAT_ERROR_INJECTION
+#     bool, depends on CRYPTO_DEV_QAT + DEBUG_FS
+#     —— 我们启用 QAT 后它变为可见且全新
+#   CRYPTO_DH_RFC7919_GROUPS
+#     bool, depends on CRYPTO_DH
+#     —— 某依赖把 CRYPTO_DH 拉成 m 后它变为可见且全新
+#
 KCONFIG_EXTRA="
 CONFIG_CRYPTO_DH_RFC7919_GROUPS=y
+CONFIG_CRYPTO_DEV_QAT_ERROR_INJECTION=n
 "
 for cfg in "$SRC_DIR/target/linux/x86/config-6.12" \
            "$SRC_DIR/target/linux/generic/config-6.12" \
@@ -337,6 +347,50 @@ EOF
         echo "    已处理: $cfg"
     fi
 done
+
+# ---------------------------------------------------------------------------
+# 关键兜底: 让目标内核的 syncconfig 也接受空输入
+#
+# 【根本问题】
+#   OpenWrt 对【工具链内核】用 `yes '' | make oldconfig` 自动应答新符号
+#   (run#9 日志中该阶段成功处理了 3175 个 NEW 符号),
+#   但对【目标内核】直接调用 `make bzImage modules`, 内部触发的 syncconfig
+#   没有 yes 管道。只要残留 1 个 NEW 符号, 非交互环境就必然失败。
+#
+#   逐个枚举 NEW 符号是打地鼠。这里改为: 在主 make 的同时用后台循环,
+#   一旦检测到内核 .config 出现, 立刻补跑 `yes '' | make oldconfig`。
+#   该操作幂等, 且在 syncconfig 之前完成即可。
+# ---------------------------------------------------------------------------
+echo ">>> 启动内核配置守护进程 (自动应答 NEW 符号)..."
+
+kernel_config_daemon() {
+    local target_kernel_dir="$SRC_DIR/build_dir/target-x86_64_musl/linux-x86_64"
+    local waited=0
+    # 最多守护 90 分钟 (覆盖工具链编译耗时)
+    while [ "$waited" -lt 5400 ]; do
+        local kdir
+        kdir=$(find "$target_kernel_dir" -maxdepth 1 -type d -name "linux-*" 2>/dev/null | head -1)
+        if [ -n "$kdir" ] && [ -f "$kdir/.config" ]; then
+            # 检查是否存在未应答的 NEW 符号
+            if ( cd "$kdir" && make ARCH=x86 syncconfig </dev/null >/dev/null 2>&1 ); then
+                echo "[守护] 内核配置已定型, 无需干预" >>"$LOG"
+                return 0
+            fi
+            echo "[守护] 检测到未应答符号, 执行 oldconfig 自动应答" >>"$LOG"
+            ( cd "$kdir" && yes '' | make ARCH=x86 oldconfig ) >>"$LOG" 2>&1
+            echo "[守护] oldconfig 完成" >>"$LOG"
+            return 0
+        fi
+        sleep 10
+        waited=$((waited + 10))
+    done
+    echo "[守护] 超时退出" >>"$LOG"
+    return 1
+}
+
+kernel_config_daemon &
+DAEMON_PID=$!
+echo "    守护进程 pid=$DAEMON_PID"
 
 echo ">>> 开始编译 (日志: $LOG)..."
 #

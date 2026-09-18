@@ -1,0 +1,144 @@
+name: Validate kernel config (FAST)
+
+# ============================================================================
+# 内核配置快速验证 —— 2-5 分钟出结果
+#
+# 背景:
+#   完整源码编译每轮要 30-50 分钟, 且失败总发生在末尾的内核 syncconfig 处。
+#   而内核配置的正确性其实【不依赖】前面的工具链编译, 可以独立验证。
+#
+# 本工作流只做:
+#   1. 浅克隆源码 (约 1 分钟)
+#   2. 注入 QAT 包 + 生成 .config (约 1 分钟)
+#   3. 只跑到内核 prepare + syncconfig (约 2-3 分钟)
+#   4. 检查是否存在未应答的 (NEW) 符号
+#
+# 这样任何内核配置问题都能在 5 分钟内暴露, 无需等待完整编译。
+# ============================================================================
+on:
+  workflow_dispatch:
+    inputs:
+      imm_branch:
+        description: "ImmortalWrt 源码分支"
+        required: true
+        default: "openwrt-25.12"
+        type: choice
+        options:
+          - openwrt-25.12
+          - openwrt-24.10
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout build repo
+        uses: actions/checkout@v6
+
+      - name: Install minimal dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq \
+            build-essential gcc g++ make perl python3 rsync unzip wget git \
+            file bzip2 gzip tar patch cpio bc genisoimage libncurses-dev \
+            libssl-dev zlib1g-dev gettext libelf-dev subversion swig time \
+            xsltproc gawk python3-distutils python3-setuptools
+
+      - name: Clone ImmortalWrt source (shallow)
+        run: |
+          git clone --depth=1 -b "${{ inputs.imm_branch }}" \
+            https://github.com/immortalwrt/immortalwrt.git /tmp/imm
+          echo "克隆完成: $(du -sh /tmp/imm | cut -f1)"
+
+      - name: Inject QAT packages
+        run: |
+          mkdir -p /tmp/imm/package/qat
+          cp -r qat-src/qat-kmod     /tmp/imm/package/qat/
+          cp -r qat-src/qat-firmware /tmp/imm/package/qat/
+          find /tmp/imm/package/qat -type f | sort
+
+      - name: Setup feeds and config
+        run: |
+          cd /tmp/imm
+          ./scripts/feeds update -a >/dev/null 2>&1
+          ./scripts/feeds install -a >/dev/null 2>&1
+
+          # 最小 seed
+          cat > .config <<'EOF'
+          CONFIG_TARGET_x86=y
+          CONFIG_TARGET_x86_64=y
+          CONFIG_TARGET_SUBTARGET="64"
+          CONFIG_TARGET_PROFILE="generic"
+          CONFIG_TARGET_MULTI_PROFILE=y
+          CONFIG_TARGET_DEVICE_x86_64_DEVICE_generic=y
+          EOF
+          make defconfig >/dev/null 2>&1
+
+          # 追加关键包
+          cat >> .config <<'EOF'
+          CONFIG_PACKAGE_kmod-crypto-qat-common=m
+          CONFIG_PACKAGE_kmod-crypto-qat-dh895xcc=m
+          CONFIG_PACKAGE_qat-firmware-dh895xcc=m
+          EOF
+          make defconfig >/dev/null 2>&1
+
+          echo "=== QAT 包是否选中 ==="
+          grep -E "CONFIG_PACKAGE_.*qat" .config || echo "!!! QAT 未选中"
+
+      # ---------------------------------------------------------------------
+      # 核心步骤: 只做到内核 prepare, 然后检查 syncconfig 能否非交互通过
+      # ---------------------------------------------------------------------
+      - name: Prepare kernel config only
+        run: |
+          cd /tmp/imm
+          echo "=== 执行 target/linux/prepare ==="
+          # 只准备内核, 不编译工具链
+          make target/linux/prepare V=s 2>&1 | tail -40 || true
+
+          KDIR=$(find build_dir -maxdepth 3 -type d -name "linux-*" | head -1)
+          echo "=== 内核目录: $KDIR ==="
+          if [ -n "$KDIR" ]; then
+            ls -la "$KDIR" | head -20
+            echo
+            echo "=== 针对 QAT 相关的内核符号检查 ==="
+            grep -iE "QAT" "$KDIR/.config" 2>/dev/null || echo "(未找到)"
+          fi
+
+      - name: Check for unanswered NEW symbols
+        run: |
+          cd /tmp/imm
+          KDIR=$(find build_dir -maxdepth 3 -type d -name "linux-*" | head -1)
+          echo "=== 内核目录: $KDIR ==="
+
+          if [ -z "$KDIR" ]; then
+            echo "::error::内核目录未生成, prepare 失败"
+            exit 1
+          fi
+
+          echo
+          echo "=== 尝试非交互 syncconfig (模拟真实构建环境) ==="
+          cd "$KDIR"
+          if make ARCH=x86 syncconfig </dev/null > /tmp/sync.log 2>&1; then
+            echo "✅ syncconfig 非交互通过 —— 内核配置无残留 NEW 符号"
+          else
+            echo "❌ syncconfig 失败, 以下是有问题的符号:"
+            grep -E "\(NEW\)|Error" /tmp/sync.log | head -30
+            echo
+            echo "::error::内核配置存在未应答的 NEW 符号"
+            exit 1
+          fi
+
+      - name: Verify QAT symbols in kernel config
+        run: |
+          cd /tmp/imm
+          KDIR=$(find build_dir -maxdepth 3 -type d -name "linux-*" | head -1)
+          echo "=== 内核 .config 中的 QAT 符号 ==="
+          grep -E "CONFIG_CRYPTO_DEV_QAT" "$KDIR/.config" || echo "!!! 未找到 QAT 内核符号"
+          echo
+          echo "=== 期望 ==="
+          echo "CONFIG_CRYPTO_DEV_QAT_DH895xCC=m"
+          echo "CONFIG_CRYPTO_DEV_QAT_DH895xCCVF=m"

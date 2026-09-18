@@ -60,7 +60,8 @@ define KernelPackage/crypto-qat-dh895xcc
 	+qat-firmware-dh895xcc
   KCONFIG:= \
 	CONFIG_CRYPTO_DEV_QAT_DH895xCC=m \
-	CONFIG_CRYPTO_DEV_QAT_DH895xCCVF=m
+	CONFIG_CRYPTO_DEV_QAT_DH895xCCVF=m \
+	CONFIG_CRYPTO_DEV_QAT_ERROR_INJECTION=n
   FILES:= \
 	$(LINUX_DIR)/drivers/crypto/intel/qat/qat_dh895xcc/qat_dh895xcc.ko \
 	$(LINUX_DIR)/drivers/crypto/intel/qat/qat_dh895xccvf/qat_dh895xccvf.ko
