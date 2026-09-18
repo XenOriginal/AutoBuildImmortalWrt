@@ -1,0 +1,91 @@
+name: Build QAT module (SDK, FAST)
+
+# ============================================================================
+# QAT 内核模块独立编译 —— 官方 SDK 方案
+#
+# 【为什么改这个方案】
+#   原方案走全量源码编译, 每轮 30-50 分钟, 且连续 5 轮卡在内核 syncconfig
+#   (CRYPTO_DH_RFC7919_GROUPS / CRYPTO_DEV_QAT_ERROR_INJECTION 等
+#    依赖型 bool 符号在非交互环境下必然失败)。
+#
+#   但实际需求只是: 官方库里【没有现成编译好的】QAT 驱动。
+#   其余软件包官方都有二进制, 用 ImageBuilder 直接装即可。
+#
+#   所以拆成两步:
+#     步骤 A (本工作流): 用 SDK 只编 QAT 模块 → 产出 .apk
+#     步骤 B (ImageBuilder): 用现成包 + 上述 .apk 打包固件
+#
+#   好处:
+#     - 每轮 10-15 分钟 (而非 30-50 分钟)
+#     - 完全绕开内核 syncconfig 的交互式提问问题
+#     - 不依赖 target config 的符号注入技巧
+#
+# 【版本匹配】
+#   25.12.1 SDK → 内核 6.12.94
+#   25.12.1 ImageBuilder → 内核 6.12.94
+#   vermagic 一致, 模块可直接被固件装载。
+# ============================================================================
+on:
+  workflow_dispatch:
+    inputs:
+      imm_version:
+        description: "ImmortalWrt 版本 (需与后续 ImageBuilder 一致)"
+        required: true
+        default: "25.12.1"
+        type: choice
+        options:
+          - "25.12.1"
+          - "25.12.0"
+          - "25.12.0-rc2"
+
+permissions:
+  contents: read
+
+jobs:
+  build-module:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout build repo
+        uses: actions/checkout@v6
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq \
+            build-essential gcc g++ make perl python3 rsync unzip wget git \
+            file bzip2 gzip tar patch cpio bc zstd libncurses-dev \
+            libssl-dev zlib1g-dev gettext libelf-dev subversion swig time \
+            xsltproc gawk python3-distutils python3-setuptools genisoimage
+
+      - name: Build QAT module with SDK
+        run: |
+          chmod +x qat-src/build-qat-module.sh
+          docker run --rm \
+            --user root \
+            -v "$PWD:/work" \
+            -v "$PWD/qat-src:/host-qat:ro" \
+            -e IMM_VERSION="${{ inputs.imm_version }}" \
+            -e FORCE_UNSAFE_CONFIGURE=1 \
+            -w /work \
+            ubuntu:22.04 \
+            /bin/bash -c '
+              set -e
+              apt-get update -qq
+              DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
+                build-essential gcc g++ make perl python3 rsync unzip wget git \
+                file bzip2 gzip tar patch cpio bc zstd libncurses-dev \
+                libssl-dev zlib1g-dev gettext libelf-dev subversion swig time \
+                xsltproc gawk python3-distutils python3-setuptools genisoimage
+              bash /work/qat-src/build-qat-module.sh
+            '
+
+      - name: Upload QAT module packages
+        uses: actions/upload-artifact@v4
+        with:
+          name: qat-module-${{ inputs.imm_version }}
+          path: |
+            out/packages/*.apk
+          if-no-files-found: error
+          retention-days: 30

@@ -327,6 +327,27 @@ PACKAGES="$PACKAGES kmod-dma-buf"
 # ===== 3.19 第三方插件 (由 shell/apk-custom-packages.sh 控制) =====
 PACKAGES="$PACKAGES $CUSTOM_PACKAGES"
 
+# ===== 3.20 Intel QAT 硬件加速 =====
+# 这些 .apk 由 SDK 工作流独立编译 (官方 feed 里没有 QAT 驱动),
+# 通过挂载的 packages/ 目录提供。
+if [ "${HAS_QAT:-false}" = "true" ]; then
+    echo "✅ 集成 QAT 驱动包 (${HAS_QAT})"
+    ls -lah /home/build/immortalwrt/packages/ | grep -i qat || true
+    PACKAGES="$PACKAGES kmod-crypto-qat-common"
+    PACKAGES="$PACKAGES kmod-crypto-qat-dh895xcc"
+    PACKAGES="$PACKAGES qat-firmware-dh895xcc"
+else
+    echo "⚠️ 未提供 QAT 包, 跳过 (HAS_QAT=${HAS_QAT:-false})"
+fi
+
+# ===== 3.21 宿主机手动调优文件 =====
+# host-files/etc/* 已在工作流中合并进 files/etc/, 此处仅确认存在
+if [ -f files/etc/sysctl.conf ]; then
+    echo "✅ 宿主机调优文件已就位 (sysctl.conf / modules.d / init.d)"
+else
+    echo "⚠️ 未找到 files/etc/sysctl.conf, 调优可能缺失"
+fi
+
 # ---------------------------------------------------------------------------
 # 4. OpenClash 内核与 GeoIP/GeoSite (若集成 openclash)
 # ---------------------------------------------------------------------------

@@ -75,7 +75,14 @@ jobs:
           cp "${{ github.workspace }}/x86-64-host/99-host.sh" \
              "${{ github.workspace }}/files/etc/uci-defaults/99-host.sh"
           chmod +x "${{ github.workspace }}/files/etc/uci-defaults/99-host.sh"
-          ls -la "${{ github.workspace }}/files/etc/uci-defaults/"
+
+          # 宿主机调优文件 (sysctl.conf / modules.d / init.d) 合并进 files/
+          # 修复: 此前该步骤缺失, 导致调优配置未打进固件
+          cp -r "${{ github.workspace }}/host-files/etc/"* "${{ github.workspace }}/files/etc/"
+          chmod +x "${{ github.workspace }}/files/etc/init.d/host-zram" 2>/dev/null || true
+
+          echo "=== files/ 内容 ==="
+          find "${{ github.workspace }}/files" -type f | sort
 
       - name: Validate PPPoE Inputs
         run: |
@@ -84,6 +91,25 @@ jobs:
               echo "::error::启用 PPPoE 时必须填写账号和密码"
               exit 1
             fi
+          fi
+
+      - name: Prepare custom packages (QAT)
+        run: |
+          # 把 SDK 编出的 QAT .apk 放进 ImageBuilder 的 packages/ 目录。
+          # 这些包是官方 feed 里【没有】的, 必须单独编译后塞进来。
+          mkdir -p "${{ github.workspace }}/packages"
+          if [ -d "${{ github.workspace }}/qat-apk" ]; then
+            cp -v "${{ github.workspace }}/qat-apk/"*.apk "${{ github.workspace }}/packages/" 2>/dev/null || true
+          fi
+          echo "=== packages/ 内容 ==="
+          ls -lah "${{ github.workspace }}/packages/" || echo "(空)"
+          # 记录是否有 QAT 包, 供后续校验
+          if ls "${{ github.workspace }}/packages/"*qat*.apk >/dev/null 2>&1; then
+            echo "HAS_QAT=true" >> "$GITHUB_ENV"
+            echo "✅ 检测到 QAT 包, 将集成进固件"
+          else
+            echo "HAS_QAT=false" >> "$GITHUB_ENV"
+            echo "⚠️ 未检测到 QAT 包, 固件将不含 QAT 驱动"
           fi
 
       - name: Build ImmortalWrt x86-64 Host
@@ -96,6 +122,7 @@ jobs:
           echo " 固件大小 : ${profile} MB"
           echo " Docker   : ${include_docker}"
           echo " Luci版本 : ${luci_version}"
+          echo " QAT 驱动 : ${HAS_QAT}"
           echo "=========================================="
           docker run --rm -i \
             --user root \
@@ -104,9 +131,11 @@ jobs:
             -v "${{ github.workspace }}/custom:/home/build/immortalwrt/files/etc/config" \
             -v "${{ github.workspace }}/x86-64-host/imm25.config:/home/build/immortalwrt/.config" \
             -v "${{ github.workspace }}/shell:/home/build/immortalwrt/shell" \
+            -v "${{ github.workspace }}/packages:/home/build/immortalwrt/packages" \
             -v "${{ github.workspace }}/x86-64-host/build.sh:/home/build/immortalwrt/build.sh" \
             -e PROFILE=$profile \
             -e INCLUDE_DOCKER=$include_docker \
+            -e HAS_QAT=$HAS_QAT \
             -e ENABLE_PPPOE=${{ inputs.enable_pppoe }} \
             -e PPPOE_ACCOUNT=${{ inputs.pppoe_account }} \
             -e PPPOE_PASSWORD=${{ inputs.pppoe_password }} \
