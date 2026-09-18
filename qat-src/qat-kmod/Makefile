@@ -32,6 +32,30 @@ PKG_BUILD_DIR:=$(KERNEL_BUILD_DIR)/packages
 include $(INCLUDE_DIR)/package.mk
 
 # ---------------------------------------------------------------------------
+# 构建钩子 —— 必须显式提供, 否则 OpenWrt 会在 PKG_BUILD_DIR 里
+# 找 Makefile 并报 "No targets specified and no makefile found"
+#
+# 内核模块由内核自身的构建系统编译, 因此 Build/Compile 留空,
+# 只需保证 Build/Prepare 创建出 PKG_BUILD_DIR 目录即可
+# (与官方 package/kernel/linux/Makefile 完全一致)。
+# ---------------------------------------------------------------------------
+define Build/Prepare
+	mkdir -p $(PKG_BUILD_DIR)
+endef
+
+define Build/Configure
+endef
+
+define Build/Quilt
+endef
+
+define Build/Compile
+endef
+
+define KernelPackage/depends
+endef
+
+# ---------------------------------------------------------------------------
 # 1. 公共层 intel_qat.ko —— 所有 QAT 驱动共享
 # ---------------------------------------------------------------------------
 define KernelPackage/crypto-qat-common
