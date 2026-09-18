@@ -349,59 +349,62 @@ EOF
 done
 
 # ---------------------------------------------------------------------------
-# 关键兜底: 让目标内核的 syncconfig 也接受空输入
+# 5.5 【确定性方案】prepare → oldconfig 落盘 → 验证 → 再编译
 #
-# 【根本问题】
-#   OpenWrt 对【工具链内核】用 `yes '' | make oldconfig` 自动应答新符号
-#   (run#9 日志中该阶段成功处理了 3175 个 NEW 符号),
-#   但对【目标内核】直接调用 `make bzImage modules`, 内部触发的 syncconfig
-#   没有 yes 管道。只要残留 1 个 NEW 符号, 非交互环境就必然失败。
+# 【历史失败复盘】
+#   run#5: 基线配置缺失 → 3172 个 NEW
+#   run#6: 误加 KCONFIG_NOSILENTUPDATE → explicit update 报错
+#   run#7: 误用 </dev/null → 遇 NEW 即 EOF 失败
+#   run#8: 预热在 build_dir 存在【之前】执行 → 被跳过, 完全无效
+#   run#9: 只剩 1 个 NEW (CRYPTO_DEV_QAT_ERROR_INJECTION), 仍失败
 #
-#   逐个枚举 NEW 符号是打地鼠。这里改为: 在主 make 的同时用后台循环,
-#   一旦检测到内核 .config 出现, 立刻补跑 `yes '' | make oldconfig`。
-#   该操作幂等, 且在 syncconfig 之前完成即可。
+# 【为什么后台守护进程也不可靠】
+#   轮询等待内核目录出现, 与 OpenWrt 的构建流程存在竞态:
+#   目录一出现, OpenWrt 可能立刻开始 syncconfig, 而守护进程
+#   还在 sleep 周期里。
+#
+# 【确定性做法】
+#   显式分三步, 不依赖任何轮询或时序:
+#     1. make target/linux/prepare   —— 同步执行, 完成后内核目录必然存在
+#     2. 在【该目录】执行 oldconfig  —— 把所有 NEW 符号一次性落盘
+#     3. 验证 syncconfig 能非交互通过 —— 确认无残留, 否则立即失败
+#   三步全部成功后才进入真正的 make world。
 # ---------------------------------------------------------------------------
-echo ">>> 启动内核配置守护进程 (自动应答 NEW 符号)..."
+echo ">>> 步骤 1/3: 准备内核 (make target/linux/prepare)..."
+make target/linux/prepare V=s 2>&1 | tail -20 >>"$LOG"
+echo "    prepare 完成"
 
-kernel_config_daemon() {
-    local target_kernel_dir="$SRC_DIR/build_dir/target-x86_64_musl/linux-x86_64"
-    local waited=0
-    # 最多守护 90 分钟 (覆盖工具链编译耗时)
-    while [ "$waited" -lt 5400 ]; do
-        local kdir
-        kdir=$(find "$target_kernel_dir" -maxdepth 1 -type d -name "linux-*" 2>/dev/null | head -1)
-        if [ -n "$kdir" ] && [ -f "$kdir/.config" ]; then
-            # 检查是否存在未应答的 NEW 符号
-            if ( cd "$kdir" && make ARCH=x86 syncconfig </dev/null >/dev/null 2>&1 ); then
-                echo "[守护] 内核配置已定型, 无需干预" >>"$LOG"
-                return 0
-            fi
-            echo "[守护] 检测到未应答符号, 执行 oldconfig 自动应答" >>"$LOG"
-            ( cd "$kdir" && yes '' | make ARCH=x86 oldconfig ) >>"$LOG" 2>&1
-            echo "[守护] oldconfig 完成" >>"$LOG"
-            return 0
-        fi
-        sleep 10
-        waited=$((waited + 10))
-    done
-    echo "[守护] 超时退出" >>"$LOG"
-    return 1
+# 定位目标内核目录 (target 用, 不是 toolchain 用)
+TARGET_KERNEL_BASE="$SRC_DIR/build_dir/target-x86_64_musl/linux-x86_64"
+KDIR=$(find "$TARGET_KERNEL_BASE" -maxdepth 1 -type d -name "linux-*" 2>/dev/null | head -1)
+
+if [ -z "$KDIR" ] || [ ! -d "$KDIR" ]; then
+    echo "!!! 未找到目标内核目录: $TARGET_KERNEL_BASE"
+    echo "--- 调试: build_dir 结构 ---"
+    find "$SRC_DIR/build_dir" -maxdepth 3 -type d -name "linux-*" 2>/dev/null | head
+    exit 1
+fi
+echo "    内核目录: $KDIR"
+
+echo ">>> 步骤 2/3: 落盘内核配置 (yes '' | make oldconfig)..."
+( cd "$KDIR" && yes '' | make ARCH=x86 oldconfig ) >>"$LOG" 2>&1 || {
+    echo "!!! oldconfig 失败, 最后 40 行:"
+    tail -40 "$LOG"
+    exit 1
 }
+echo "    oldconfig 完成"
 
-kernel_config_daemon &
-DAEMON_PID=$!
-echo "    守护进程 pid=$DAEMON_PID"
+echo ">>> 步骤 3/3: 验证 syncconfig 可非交互通过..."
+if ( cd "$KDIR" && make ARCH=x86 syncconfig </dev/null >/tmp/syncconfig-test.log 2>&1 ); then
+    echo "    ✅ 内核配置已定型, 无残留 NEW 符号"
+else
+    echo "    ❌ syncconfig 仍失败, 残留符号:"
+    grep -E "\(NEW\)|Error" /tmp/syncconfig-test.log | head -20
+    echo "!!! 提前终止, 避免浪费完整编译时间"
+    exit 1
+fi
 
 echo ">>> 开始编译 (日志: $LOG)..."
-#
-# 【关键教训 — run #6 失败原因】
-#   不要设置 KCONFIG_NOSILENTUPDATE=1 !
-#   该变量会让内核 syncconfig 在遇到新符号时直接报错退出:
-#       *** The configuration requires explicit update.
-#       make[8]: *** [scripts/kconfig/Makefile:85: syncconfig] Error 1
-#   OpenWrt 自身已用 `yes '' | make oldconfig` 自动应答新符号,
-#   不应再叠加此限制。
-#
 export CI=1
 export DEBIAN_FRONTEND=noninteractive
 
