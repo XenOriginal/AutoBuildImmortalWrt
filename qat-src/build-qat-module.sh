@@ -100,10 +100,54 @@ for sym in CONFIG_PACKAGE_kmod-crypto-qat-common \
 done
 
 # ---------------------------------------------------------------------------
-# 4. 编译
+# 3.5 关键技术验证: QAT 依赖的 crypto 符号是否可用
+#
+# QAT 公共层 (intel_qat.ko) 会引用内核 crypto API 的导出符号。
+# 若官方内核未导出这些符号, 模块链接会失败。
+# 这里预先检查内核 Module.symvers, 提前暴露风险。
 # ---------------------------------------------------------------------------
-echo ">>> 开始编译 QAT 模块..."
-make -j"$(nproc)" V=s 2>&1 | tail -60
+echo
+echo "=== 检查内核导出符号 (QAT 依赖) ==="
+SYMVERS=$(find . -name "Module.symvers" 2>/dev/null | head -1)
+if [ -n "$SYMVERS" ]; then
+    echo "符号表: $SYMVERS"
+    for sym in crypto_register_alg crypto_unregister_alg crypto_alloc_aead \
+               pci_enable_device pci_request_regions debugfs_create_dir; do
+        if grep -q "\\b${sym}\\b" "$SYMVERS" 2>/dev/null; then
+            echo "  ✅ $sym"
+        else
+            echo "  ⚠️  $sym 未找到 (可能导致链接失败)"
+        fi
+    done
+else
+    echo "  (Module.symvers 尚未生成, 跳过检查)"
+fi
+
+# ---------------------------------------------------------------------------
+# 4. 编译 —— 只编 QAT 相关包, 不要 make world
+#
+# 【run #1 教训】
+#   之前用 `make -j$(nproc)` 会编译整个 world, 结果在完全无关的
+#   golang-bootstrap 上浪费 10 分钟后失败:
+#       time: package/feeds/packages/golang-bootstrap/host-compile#1025.77
+#       make[1]: *** [package/Makefile:182: ...stamp/.package_compile] Error 2
+#   SDK 的正确用法是只编【需要的包】, 依赖会自动处理。
+# ---------------------------------------------------------------------------
+echo ">>> 开始编译 QAT 模块 (仅目标包)..."
+
+# 用【目录路径】作为 make 目标最可靠:
+# 日志确认 SDK 内的路径为 package/qat/qat-kmod/ 与 package/qat/qat-firmware/
+make -j"$(nproc)" V=s package/qat/qat-kmod/compile 2>&1 | tail -80
+
+echo ">>> 编译 QAT 固件包..."
+make -j"$(nproc)" V=s package/qat/qat-firmware/compile 2>&1 | tail -30
+
+# 生成 .apk 包 (install 目标负责打包)
+echo ">>> 打包 (.apk)..."
+make -j"$(nproc)" V=s \
+    package/qat/qat-kmod/install \
+    package/qat/qat-firmware/install \
+    2>&1 | tail -40
 
 echo
 echo "=== 编译产物 (.apk) ==="
