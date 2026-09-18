@@ -201,9 +201,6 @@ HOST_PKGS="$HOST_PKGS
 CONFIG_PACKAGE_kmod-crypto-qat-common=m
 CONFIG_PACKAGE_kmod-crypto-qat-dh895xcc=m
 CONFIG_PACKAGE_qat-firmware-dh895xcc=m
-CONFIG_KERNEL_CRYPTO_DH=y
-CONFIG_KERNEL_CRYPTO_DH_RFC7919_GROUPS=y
-CONFIG_KERNEL_CRYPTO_RSA=y
 "
 
 # ---- Docker (可选) ----
@@ -301,40 +298,45 @@ echo "    QAT 包数量      = $(grep -c '^CONFIG_PACKAGE_.*qat' .config)"
 echo "    .config 总行数  = $(wc -l < .config)"
 
 # ---------------------------------------------------------------------------
-# 5.5 预生成内核 .config, 避免 syncconfig 在编译期遇到 (NEW) 符号
+# 5.5 彻底消除内核 (NEW) 符号 —— 写入 target config
 #
-# 【run #7 失败根因】
-#   最终内核阶段直接执行 `make bzImage modules`, 该命令内部会触发
-#   syncconfig。若此时存在尚未回答的新符号 (如 CRYPTO_DH_RFC7919_GROUPS),
-#   kconfig 会打印 `[N/y/?] (NEW)` 并读取 stdin; 而我们的 stdin 是
-#   /dev/null, 立即 EOF, 于是:
-#       RFC 7919 FFDHE groups (CRYPTO_DH_RFC7919_GROUPS) [N/y/?] (NEW)
-#       make[8]: *** [scripts/kconfig/Makefile:85: syncconfig] Error 1
+# 【run #8 失败根因】
+#   上一轮把预热放在编译【之前】, 日志证明其无效:
+#       >>> 预热内核配置...
+#           (跳过: 内核 build_dir 尚不存在)
+#   时间线: 12:47:20 预热跳过 → 13:30:48 内核解压 → 13:31:10 失败
 #
-#   对比: 工具链内核阶段之所以成功, 是因为 OpenWrt 显式使用了
-#   `yes '' | make oldconfig` 自动应答。
+# 【关键机制】
+#   内核 .config.target 由这三份文件合成 (日志可见):
+#       kconfig.pl + + target/linux/generic/config-6.12 \
+#                      target/linux/x86/config-6.12 \
+#                      target/linux/x86/64/config-6.12
+#   而 CRYPTO_DH_RFC7919_GROUPS 是 bool 型, `depends on CRYPTO_DH`。
+#   当 CRYPTO_DH=m 时它变为"可见且全新", kconfig 必须提问, 于是失败。
 #
-#   解法: 在正式编译前, 先对目标内核执行一次 `yes '' | make oldconfig`,
-#         把所有 (NEW) 符号一次性落盘到 .config。此后 syncconfig 无事可做。
+# 【解法】直接把这行写进 target config —— 它是 .config.target 的源头,
+#         随构建自动合并, 无时序依赖, 无竞态。
 # ---------------------------------------------------------------------------
-KERNEL_BUILD_DIR="$SRC_DIR/build_dir/target-x86_64_musl/linux-x86_64"
-echo ">>> 预热内核配置 (消除残留的 NEW 符号)..."
-if [ -d "$KERNEL_BUILD_DIR" ]; then
-    KDIR=$(find "$KERNEL_BUILD_DIR" -maxdepth 1 -type d -name "linux-*" | head -1)
-    if [ -n "$KDIR" ] && [ -d "$KDIR" ]; then
-        echo "    目标内核目录: $KDIR"
-        # 先执行 prepare 让 OpenWrt 生成 .config.set
-        make target/linux/prepare V=s >>"$LOG" 2>&1 || true
-        if [ -f "$KDIR/.config" ] || [ -f "$KDIR/.config.set" ]; then
-            ( cd "$KDIR" && yes '' | make ARCH=x86 oldconfig >>"$LOG" 2>&1 ) || true
-            echo "    oldconfig 完成, (NEW) 符号已落盘"
-        else
-            echo "    (跳过: 内核 .config 尚未生成)"
-        fi
+echo ">>> 注入内核符号以消除 (NEW) 提示..."
+# 这些是"依赖型"符号: 本身不显眼, 但当其依赖项被拉成 =m 时会变成
+# 全新可见符号, 迫使 kconfig 提问, 在非交互环境下直接失败。
+KCONFIG_EXTRA="
+CONFIG_CRYPTO_DH_RFC7919_GROUPS=y
+"
+for cfg in "$SRC_DIR/target/linux/x86/config-6.12" \
+           "$SRC_DIR/target/linux/generic/config-6.12" \
+           "$SRC_DIR/target/linux/x86/64/config-6.12"; do
+    if [ -f "$cfg" ]; then
+        while IFS= read -r line; do
+            [ -z "$line" ] && continue
+            sym="${line%%=*}"
+            grep -q "^${sym}=" "$cfg" || echo "$line" >> "$cfg"
+        done <<EOF
+$KCONFIG_EXTRA
+EOF
+        echo "    已处理: $cfg"
     fi
-else
-    echo "    (跳过: 内核 build_dir 尚不存在)"
-fi
+done
 
 echo ">>> 开始编译 (日志: $LOG)..."
 #
