@@ -201,6 +201,10 @@ HOST_PKGS="$HOST_PKGS
 CONFIG_PACKAGE_kmod-crypto-qat-common=m
 CONFIG_PACKAGE_kmod-crypto-qat-dh895xcc=m
 CONFIG_PACKAGE_qat-firmware-dh895xcc=m
+CONFIG_PACKAGE_kmod-crypto-authenc=m
+CONFIG_PACKAGE_kmod-crypto-kpp=m
+CONFIG_PACKAGE_kmod-crypto-rsa=m
+CONFIG_PACKAGE_kmod-lib-crc8=m
 "
 
 # ---- Docker (可选) ----

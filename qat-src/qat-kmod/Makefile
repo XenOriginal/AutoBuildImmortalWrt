@@ -63,15 +63,22 @@ define KernelPackage/crypto-qat-common
   TITLE:=Intel QAT common library
   DEPENDS:=@TARGET_x86_64 \
 	+kmod-crypto-manager \
-	+kmod-crypto-acompress
+	+kmod-crypto-acompress \
+	+kmod-crypto-authenc \
+	+kmod-crypto-kpp \
+	+kmod-crypto-rsa \
+	+kmod-lib-crc8
   KCONFIG:= \
 	CONFIG_CRYPTO_HW=y \
 	CONFIG_CRYPTO_DEV_QAT=m \
+	CONFIG_CRYPTO_DH=m \
 	CONFIG_PCI_IOV=y \
 	CONFIG_PCI_MSI=y \
 	CONFIG_PCIEAER=y
-  FILES:=$(LINUX_DIR)/drivers/crypto/intel/qat/qat_common/intel_qat.ko
-  AUTOLOAD:=$(call AutoLoad,08,intel_qat)
+  FILES:= \
+	$(LINUX_DIR)/drivers/crypto/intel/qat/qat_common/intel_qat.ko \
+	$(LINUX_DIR)/crypto/dh_generic.ko
+  AUTOLOAD:=$(call AutoLoad,08,dh_generic intel_qat)
 endef
 
 define KernelPackage/crypto-qat-common/description
