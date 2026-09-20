@@ -254,7 +254,7 @@ grep -E "CONFIG_CRYPTO_DEV_QAT_DH895" package/qat/qat-kmod/Makefile
 echo ">>> 预检系统依赖..."
 MISSING_DEPS=""
 for cmd in gcc g++ make perl python3 rsync unzip wget git file \
-           mkisofs genisoimage bzip2 tar patch cpio bc; do
+           mkisofs genisoimage bzip2 tar patch cpio bc flex bison; do
     if ! command -v "$cmd" >/dev/null 2>&1; then
         # mkisofs 与 genisoimage 任一存在即可
         case "$cmd" in
@@ -269,7 +269,7 @@ for cmd in gcc g++ make perl python3 rsync unzip wget git file \
 done
 if [ -n "$MISSING_DEPS" ]; then
     echo "!!! 缺失必需的系统依赖:$MISSING_DEPS"
-    echo "!!! Ubuntu 22.04 请执行: apt-get install -y genisoimage build-essential ..."
+    echo "!!! Ubuntu 22.04 请执行: apt-get install -y flex bison genisoimage build-essential ..."
     exit 1
 fi
 echo "  OK: 系统依赖齐全"
