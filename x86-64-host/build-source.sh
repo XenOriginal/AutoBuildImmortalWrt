@@ -393,8 +393,18 @@ if [ ! -f "$KDIR/Makefile" ]; then
 fi
 echo "    内核目录: $KDIR"
 
-echo ">>> 步骤 2/3: 落盘内核配置 (yes '' | make oldconfig)..."
-( cd "$KDIR" && yes '' | make ARCH=x86 oldconfig ) >>"$LOG" 2>&1 || {
+echo ">>> 步骤 2/3: 落盘内核配置 (olddefconfig / yes '' | make oldconfig)..."
+# 注意: 顶层开启了 set -o pipefail。
+# 当 make oldconfig 写入配置并关闭 stdin 后, yes 写入 broken pipe 会产生 SIGPIPE (退出码 141)。
+# 在 pipefail 下 141 会被判定为管道命令失败!
+# 因此此处首选非交互官方指令 olddefconfig; 若使用管道必须隔离 pipefail。
+(
+    cd "$KDIR"
+    make ARCH=x86 olddefconfig >>"$LOG" 2>&1 || {
+        set +o pipefail
+        yes '' | make ARCH=x86 oldconfig >>"$LOG" 2>&1
+    }
+) || {
     echo "!!! oldconfig 失败, 最后 40 行:"
     tail -40 "$LOG"
     exit 1
