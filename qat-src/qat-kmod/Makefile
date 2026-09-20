@@ -67,6 +67,7 @@ define KernelPackage/crypto-qat-common
 	+kmod-crypto-authenc \
 	+kmod-crypto-kpp \
 	+kmod-crypto-rsa \
+	+kmod-crypto-rng \
 	+kmod-lib-crc8
   KCONFIG:= \
 	CONFIG_CRYPTO_HW=y \
