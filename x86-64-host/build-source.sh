@@ -99,8 +99,15 @@ make defconfig >>"$LOG" 2>&1
 echo ">>> 叠加宿主机个性化选项..."
 
 # ---- 版本信息 ----
+# 【改为 SNAPSHOT 源】
+#   本固件基于 openwrt-25.12 分支的最新 tip 编译 (VERSION_CODE=r0-<sha>),
+#   属于滚动更新性质, 与 releases/25.12.x 正式版的包哈希并不对齐。
+#   若仍指向 releases/25.12.1, 在线安装包时会因版本/哈希不匹配而失败。
+#   因此改用 snapshots 源, 与本构建的基点一致。
 sed -i "/^CONFIG_VERSION_REPO=/d" .config
-echo 'CONFIG_VERSION_REPO="https://downloads.immortalwrt.org/releases/25.12.1"' >> .config
+echo 'CONFIG_VERSION_REPO="https://downloads.immortalwrt.org/snapshots"' >> .config
+sed -i "/^CONFIG_VERSION_NUMBER=/d" .config
+echo 'CONFIG_VERSION_NUMBER="SNAPSHOT"' >> .config
 
 # ---- 根文件系统大小 ----
 sed -i "/^CONFIG_TARGET_ROOTFS_PARTSIZE=/d" .config
