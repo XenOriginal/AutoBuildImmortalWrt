@@ -1,0 +1,64 @@
+#!/bin/sh
+# ============================================================================
+# 首次启动: 让路给内核 HSUART 驱动
+#
+# 【背景】
+#   本机此前由【用户态桥】提供串口控制台:
+#       /etc/init.d/hsuart-console  →  /usr/bin/ruby /usr/bin/hsuart-console 57600
+#   它经 /dev/port 直写 I/O 0x2050 (HSUART 的 legacy 16550 窗口) 桥接到 pty,
+#   之所以存在, 是因为内核 8250_pci 把 00:1a.0 列进了 blacklist, 而旧固件
+#   没有开启 CONFIG_SERIAL_8250_MID ⇒ 内核无人接管该端口。
+#
+# 【本固件的变化】
+#   已开启 CONFIG_SERIAL_8250_MID=y + CONFIG_HSU_DMA=y,
+#   端口现由内核 8250_mid 驱动接管 (dnv_board)。
+#
+# 【为什么必须停掉它】
+#   两者会互相踩: 用户态那条路往同一个 I/O 口写数据, 会污染内核 console 输出
+#   (例如登录提示被插入乱码、内核日志丢字符)。
+#
+# 【处置】
+#   停止并禁止其开机自启。**保留文件本身** (便于对照与原样回退), 只摘掉
+#   /etc/rc.d 链接。
+#
+# 【为什么需要这一步】
+#   该服务是手工放进 overlay 的 (不属于任何 apk 包, 已实测确认),
+#   正常情况下 sysupgrade 不会保留它 (keep.d/base-files 只保留 /etc/config、
+#   /etc/dropbear、/etc/profile.d)。本脚本是【防御性措施】, 覆盖 overlay
+#   被保留、或人为再次放入的情形。
+#
+# 本脚本为 uci-defaults, 首次启动执行一次后即被删除。
+# ============================================================================
+
+LOG=/etc/hsuart-kernel-console.log
+
+{
+    echo "=== $(date) 98-hsuart-kernel-console (首次启动) ==="
+
+    if [ -x /etc/init.d/hsuart-console ]; then
+        echo "发现用户态 HSUART 桥: /etc/init.d/hsuart-console"
+        /etc/init.d/hsuart-console stop    2>&1 | sed 's/^/  stop    : /'
+        /etc/init.d/hsuart-console disable 2>&1 | sed 's/^/  disable : /'
+        echo "  → 已停用 (rc.d 链接已移除)"
+    else
+        echo "未发现用户态 HSUART 桥, 无需处理"
+    fi
+
+    # 双保险: 清掉任何残留的 rc.d 链接
+    rm -f /etc/rc.d/S*hsuart-console /etc/rc.d/K*hsuart-console 2>/dev/null
+
+    # 顺带记录一次串口拓扑, 便于刷机后对照 (真实结论看 hsuart-console-detect)
+    echo "--- /proc/tty/driver/serial ---"
+    cat /proc/tty/driver/serial 2>/dev/null
+
+    echo "--- PCI 00:1a.x 驱动绑定 ---"
+    for d in /sys/bus/pci/devices/0000:00:1a.*; do
+        [ -e "$d" ] || continue
+        echo "  $(basename "$d") -> $(readlink "$d/driver" 2>/dev/null || echo '(未绑定)')"
+    done
+} >>"$LOG" 2>&1
+
+logger -t hsuart-console "用户态桥已让路给内核 8250_mid 驱动 (详见 $LOG)"
+
+# uci-defaults 必须返回 0, 否则会被判定失败并在下次启动重跑
+exit 0

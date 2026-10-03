@@ -113,11 +113,16 @@ jobs:
           cp x86-64-host/99-host.sh files/etc/uci-defaults/99-host.sh
           chmod +x files/etc/uci-defaults/99-host.sh
 
-          # 宿主机调优文件 (sysctl.conf / modules.d / init.d) 合并进 files/
+          # 宿主机调优文件 (sysctl.conf / modules.d / init.d / uci-defaults / rc.d)
+          # 合并进 files/ —— 该目录随后被 OpenWrt 的 prepare_rootfs 覆盖到 rootfs
           cp -r host-files/etc/* files/etc/
-          chmod +x files/etc/init.d/host-zram
-          echo "--- files/ 内容 ---"
-          find files -type f | sort
+          # 可执行位: git 已记录 +x, 这里再兜一层 (兼容 core.fileMode=false 的检出)
+          chmod +x files/etc/init.d/* 2>/dev/null || true
+          chmod +x files/etc/uci-defaults/* 2>/dev/null || true
+          echo "--- files/etc 内容 (含符号链接) ---"
+          find files/etc -mindepth 1 | sort
+          echo "--- rc.d (开机自启链接) ---"
+          ls -l files/etc/rc.d/ 2>/dev/null || echo "(无 rc.d)"
 
           # 管理地址注入
           mkdir -p files/etc/config
@@ -186,6 +191,18 @@ jobs:
           echo
           echo "=== 内核模块包 ==="
           ls -la bin/targets/x86/64/kmods/*/ 2>/dev/null | grep -i qat || echo "(kmods 中未找到 qat)"
+          echo
+          echo "=== 串口控制台 (Atom C3000 HSUART) ==="
+          # 内核侧符号由 build-source.sh 在 prepare 后【两次断言】(见 5.6 / verify_serial_kconfig),
+          # 此处只复核最终 .config 里的 OpenWrt 层配置确实落盘。
+          if [ -f host-final.config ]; then
+            grep -E '^CONFIG_(TARGET_SERIAL|GRUB_BAUDRATE|GRUB_BOOTOPTS)=' host-final.config \
+              || echo "::error::host-final.config 中缺少串口控制台配置"
+          else
+            echo "::warning::未找到 host-final.config, 无法复核串口配置"
+          fi
+          echo "--- 固件内含的串口相关内核模块 (8250_mid/HSU_DMA 为 =y 内建, 不会出现在 kmods) ---"
+          find bin/ -iname '*8250*' -o -iname '*hsu*' 2>/dev/null | head || true
 
       - name: Upload firmware
         uses: actions/upload-artifact@v4

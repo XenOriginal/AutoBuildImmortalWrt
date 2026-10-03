@@ -7,7 +7,9 @@
 #   ImageBuilder 只能安装官方 feed 中【已有】的二进制包, 无法新增内核驱动。
 #   本脚本走完整源码编译, 因此可以:
 #     1. 启用 CONFIG_CRYPTO_DEV_QAT_* —— Intel QAT DH895XCC 硬件加速
-#     2. 任意增删内核配置与软件包
+#     2. 启用 CONFIG_SERIAL_8250_MID + HSU_DMA —— Atom C3000 (Denverton)
+#        板载 HSUART (PCI 00:1a.0) 作为标准 Linux 串口控制台 (详见 5.6 节)
+#     3. 任意增删内核配置与软件包
 #
 # 注意: 源码编译耗时远长于 ImageBuilder (首次约 1.5-3 小时)。
 # ============================================================================
@@ -112,6 +114,29 @@ echo 'CONFIG_VERSION_NUMBER="SNAPSHOT"' >> .config
 # ---- 根文件系统大小 ----
 sed -i "/^CONFIG_TARGET_ROOTFS_PARTSIZE=/d" .config
 echo "CONFIG_TARGET_ROOTFS_PARTSIZE=${PROFILE}" >> .config
+
+# ---- 串口控制台 (Atom C3000 HSUART) ----
+# CONFIG_TARGET_SERIAL 一处决定两个位置 (target/linux/x86/image/Makefile 与 base-files.mk):
+#   1) grub.cfg 内核命令行 → console=<ttyS>,<baud>n8
+#   2) /etc/inittab 里 @GRUB_SERIAL@ 占位符 → <ttyS>::askfirst:/usr/libexec/login.sh
+# 取值必须是真实的 HSUART 节点。编号推导见 5.6 节: 物理口 UAR0 (00:1a.0) = ttyS4。
+# 空值会让 base-files.mk 直接 $(error) 终止构建, 故必须显式给值。
+sed -i "/^CONFIG_TARGET_SERIAL=/d" .config
+echo 'CONFIG_TARGET_SERIAL="ttyS4"' >> .config
+
+# BIOS console redirection 实测 57600 8N1 (设备侧字节率偏差 +0.07%)。
+# 三处必须一致, 否则控制台乱码: BIOS / 内核 console= / PC 侧串口工具。
+# 本项默认 115200, 与本机 BIOS 不符。
+sed -i "/^CONFIG_GRUB_BAUDRATE=/d" .config
+echo 'CONFIG_GRUB_BAUDRATE=57600' >> .config
+
+# 兜底: CONFIG_GRUB_BOOTOPTS 会被【前置】到内核命令行
+# (image/Makefile: BOOTOPTS=$(CONFIG_GRUB_BOOTOPTS); @CMDLINE@=$(BOOTOPTS) $(GRUB_CONSOLE_CMDLINE))。
+# 多声明一个候选 console= 是官方支持的注入口, 且内核对该端口不存在时会静默忽略;
+# 万一实测编号与 5.6 节推导不符, 仍能在物理口上看到内核启动日志。
+# 登录口不依赖它 —— 由固件内 hsuart-console-detect 服务按 /sys 动态补齐。
+sed -i "/^CONFIG_GRUB_BOOTOPTS=/d" .config
+echo 'CONFIG_GRUB_BOOTOPTS="console=ttyS4,57600n8 console=ttyS5,57600n8"' >> .config
 
 # ---- 宿主机必备软件包 ----
 HOST_PKGS="
@@ -361,6 +386,138 @@ EOF
 done
 
 # ---------------------------------------------------------------------------
+# 5.6 【串口控制台】Intel Atom C3000 (Denverton) 板载 HSUART
+#
+# 硬件: PCI 00:1a.0 = 8086:19d8 (Atom C3000 HSUART / ACPI 名 UAR0),
+#       BAR0 = I/O 0x2050 (legacy 16550 窗口), BAR1 = MMIO (dnv_board 用 BAR1)。
+#       本机 00:1a.1 / 00:1a.2 同样存在 (UAR1/UAR2), 会被一并接管。
+#
+# 【为什么静默】
+#   drivers/tty/serial/8250/8250_pci.c 有一张 blacklist[], 把 0x19d8 显式排除,
+#   强制让路给 8250_mid.c 的 dnv_board; 而本分支的
+#   target/linux/x86/64/config-6.12 既没有 CONFIG_SERIAL_8250_MID,
+#   也没有 CONFIG_HSU_DMA (8250_mid.c 无条件 #include <linux/dma/hsu.h> 并调用
+#   hsu_dma_probe(), 必须 =y 否则链接失败)。
+#   ⇒ 无人接管 → dmesg: "ignoring port, enable SERIAL_8250_MID to handle",
+#     物理串口全静默。
+#   开 =y 后 blacklist 项自身变哑 (driver_data == 0), 8250_pci 仍返回 -ENODEV
+#   让路, 端口归 8250_mid —— 这是上游既定分工, 【不需要改任何内核源码】。
+#
+# 【为什么 NR_UARTS 必须写死 16】
+#   generic/config-6.12 是 NR_UARTS=2 / RUNTIME_UARTS=2, 而本机运行值实测为 16。
+#   行号总数只由 nr_uarts 决定 (serial8250_find_match_or_unused 的三次扫描
+#   全部是 for (i = 0; i < nr_uarts; i++))。行数不足时, 末次回退会让 PCI 口
+#   顶掉 0-3 号 ISA 幽灵口 (iobase != 0 且 PORT_UNKNOWN), 编号整体前移,
+#   CONFIG_TARGET_SERIAL 就会指向不存在的节点、登录口静默失效。
+#
+# 【ttyS 编号推导 —— 依据内核源码 + 本机 /proc/tty/driver/serial 实证】
+#   1) arch/x86 的 SERIAL_PORT_DFNS 先注册 4 个 ISA 幽灵口 → 占 0/1/2/3
+#      (本机实测: 0-3 = uart:unknown, iobase 0x3F8/0x2F8/0x3E8/0x2E8)
+#   2) 之后按【链接顺序】执行各 PCI 驱动的 device_initcall:
+#        drivers/tty/serial/8250/Makefile  第41行 8250_mid.o  ← 先注册
+#                                          第46行 8250_pci.o  ← 后注册
+#      ⇒ 8250_mid 先探测 00:1a.0/1/2, 取走前 3 个 iobase==0 的空槽 = 4/5/6
+#        8250_pci 再探测 00:1b.3 (Intel ME KT) → 7
+#      (本机现状佐证: MID 未开时, 00:1b.3 正是 ttyS4)
+#   3) 8250_mid 不设置 port->line (memset 后为 0), 而槽 0 是 ISA 幽灵口
+#      (iobase != 0), 故 "try line number first" 提示必然落空 → 走首个空闲槽。
+#   ⇒ 物理控制台 UAR0 (00:1a.0) = 【ttyS4】(ttyS5 是 UAR1, 无外接)
+#
+#   ★ 兜底: 万一实测编号与上述推导不符, 不必为编号再刷一次机 ——
+#     固件内的 hsuart-console-detect 服务会在每次启动时按 /sys 反查真实编号,
+#     并自动补上 inittab 登录口。
+#
+# 【合并顺序保证生效】
+#   include/target.mk: LINUX_KCONFIG_LIST = generic → x86 → x86/64,
+#   经 scripts/kconfig.pl 的 '+' 语义(后加载覆盖先加载), 故只写
+#   子目标 x86/64/config-6.12 即可稳定胜出, 且不会污染 generic。
+# ---------------------------------------------------------------------------
+echo ">>> 注入串口控制台内核符号 (Atom C3000 HSUART)..."
+
+# set_kconfig <file> <symbol> <value>
+#   已存在则原地替换 (含 "# CONFIG_X is not set" 形式), 否则追加。
+set_kconfig() {
+    local file="$1" sym="$2" val="$3"
+    if grep -qE "^${sym}=" "$file"; then
+        sed -i "s|^${sym}=.*|${sym}=${val}|" "$file"
+    elif grep -qE "^# ${sym} is not set" "$file"; then
+        sed -i "s|^# ${sym} is not set|${sym}=${val}|" "$file"
+    else
+        echo "${sym}=${val}" >> "$file"
+    fi
+}
+
+SUB_CONFIG="$SRC_DIR/target/linux/x86/64/config-6.12"
+if [ ! -f "$SUB_CONFIG" ]; then
+    echo "!!! 未找到子目标内核配置: $SUB_CONFIG"
+    exit 1
+fi
+while IFS= read -r line; do
+    [ -z "$line" ] && continue
+    set_kconfig "$SUB_CONFIG" "${line%%=*}" "${line#*=}"
+    echo "    + $line"
+done <<'SERIAL_KCONFIG'
+CONFIG_HSU_DMA=y
+CONFIG_SERIAL_8250_MID=y
+CONFIG_SERIAL_8250_NR_UARTS=16
+CONFIG_SERIAL_8250_RUNTIME_UARTS=16
+SERIAL_KCONFIG
+echo "    写入文件: $SUB_CONFIG"
+
+# ---------------------------------------------------------------------------
+# 5.7 【可观测性】把内核配置本身装进固件
+#
+# 刷机后要核验 "CONFIG_SERIAL_8250_MID 到底有没有生效", 只看 dmesg/lsmod
+# 属于间接推断 (能反推, 但要绕)。开启 IKCONFIG_PROC 后固件内会有 /proc/config.gz:
+#     zgrep -E 'SERIAL_8250_MID|HSU_DMA|NR_UARTS' /proc/config.gz
+# 这是对本次改动最直接的证明, 也让今后排查内核配置问题不必重新编译。
+# 代价: 内核里多一份压缩后的配置 blob (约几十 KB), 无运行时开销。
+# ---------------------------------------------------------------------------
+echo ">>> 注入内核配置自省符号 (IKCONFIG_PROC)..."
+for kv in CONFIG_IKCONFIG=y CONFIG_IKCONFIG_PROC=y; do
+    set_kconfig "$SUB_CONFIG" "${kv%%=*}" "${kv#*=}"
+    echo "    + $kv"
+done
+
+# 内核合并结果断言 —— 把"配置没生效"从'3 小时后才知道'提前到'prepare 阶段即失败'
+# verify_serial_kconfig <内核构建目录> <阶段标签>
+verify_serial_kconfig() {
+    local kdir="$1" label="$2" kcfg="$1/.config" bad=0 want got sym
+    echo ">>> 校验内核串口配置 ($label): $kcfg"
+    if [ ! -f "$kcfg" ]; then
+        echo "    ❌ 内核 .config 不存在, 无法校验"
+        return 1
+    fi
+    for sym in CONFIG_SERIAL_8250_MID CONFIG_HSU_DMA \
+               CONFIG_SERIAL_8250_NR_UARTS CONFIG_SERIAL_8250_RUNTIME_UARTS \
+               CONFIG_IKCONFIG CONFIG_IKCONFIG_PROC; do
+        case "$sym" in
+            *NR_UARTS|*RUNTIME_UARTS) want=16 ;;
+            *)                        want=y  ;;
+        esac
+        # 注意: 顶层开了 set -o pipefail, 符号缺失时 grep 会返回 1,
+        # 若不加 '|| true' 则赋值语句本身失败, 会被 set -e 直接中止 ——
+        # 那样就看不到下面精心准备的诊断信息了。
+        got=$(grep -E "^${sym}=" "$kcfg" 2>/dev/null | head -1 | cut -d= -f2- || true)
+        if [ "$got" = "$want" ]; then
+            echo "    ✅ ${sym}=${got}"
+        else
+            echo "    ❌ ${sym} 期望 '${want}', 实际 '${got:-未设置}'"
+            bad=1
+        fi
+    done
+    if [ "$bad" -ne 0 ]; then
+        echo "!!! 串口控制台内核配置未生效 (可能被 generic config 覆盖)"
+        echo "--- 合并结果中的相关行 ---"
+        grep -nE "SERIAL_8250_MID|HSU_DMA|SERIAL_8250_NR_UARTS|SERIAL_8250_RUNTIME_UARTS" "$kcfg" || true
+        echo "--- 子目标 config 中的相关行 ---"
+        grep -nE "SERIAL_8250_MID|HSU_DMA|SERIAL_8250_NR_UARTS|SERIAL_8250_RUNTIME_UARTS" "$SUB_CONFIG" || true
+        return 1
+    fi
+    return 0
+}
+
+# ---------------------------------------------------------------------------
 # 5.5 【确定性方案】prepare → oldconfig 落盘 → 验证 → 再编译
 #
 # 【历史失败复盘】
@@ -405,6 +562,12 @@ if [ ! -f "$KDIR/Makefile" ]; then
 fi
 echo "    内核目录: $KDIR"
 
+# 尽早断言串口配置已合入 —— 不通过就地失败, 不浪费后面 1.5-3 小时
+verify_serial_kconfig "$KDIR" "prepare 后" || {
+    echo "!!! 提前终止: 串口控制台配置未生效"
+    exit 1
+}
+
 echo ">>> 步骤 2/3: 落盘内核配置 (olddefconfig / yes '' | make oldconfig)..."
 # 注意: 顶层开启了 set -o pipefail。
 # 当 make oldconfig 写入配置并关闭 stdin 后, yes 写入 broken pipe 会产生 SIGPIPE (退出码 141)。
@@ -433,6 +596,12 @@ else
     exit 1
 fi
 
+# 落盘后再复核一次 —— olddefconfig 理论上不会改动这些符号, 但必须证明而非假设
+verify_serial_kconfig "$KDIR" "olddefconfig 后" || {
+    echo "!!! 提前终止: 内核配置定型后串口符号丢失"
+    exit 1
+}
+
 echo ">>> 开始编译 (日志: $LOG)..."
 export CI=1
 export DEBIAN_FRONTEND=noninteractive
@@ -453,6 +622,33 @@ ls -lah bin/targets/x86/64/ 2>/dev/null || true
 # 校验 QAT 模块确实被编译进产物
 echo ">>> 校验 QAT 内核模块:"
 find bin/ -name "*qat*" 2>/dev/null || echo "(未找到 qat 文件)"
+
+# 校验串口控制台相关配置确实落进最终产物
+echo ">>> 校验串口控制台 (Atom C3000 HSUART):"
+echo "    TARGET_SERIAL  = $(grep '^CONFIG_TARGET_SERIAL=' .config | cut -d= -f2-)"
+echo "    GRUB_BAUDRATE  = $(grep '^CONFIG_GRUB_BAUDRATE=' .config | cut -d= -f2-)"
+echo "    GRUB_BOOTOPTS  = $(grep '^CONFIG_GRUB_BOOTOPTS=' .config | cut -d= -f2-)"
+echo "    QAT 包数量     = $(grep -c '^CONFIG_PACKAGE_.*qat' .config)"
+# inittab 由 base-files 在 rootfs 暂存目录里生成 (@GRUB_SERIAL@ 占位符被替换)
+INITTAB=$(find "$SRC_DIR/build_dir/target-x86_64_musl" -maxdepth 3 -path '*/etc/inittab' 2>/dev/null | head -1)
+if [ -n "$INITTAB" ] && [ -f "$INITTAB" ]; then
+    echo "    inittab: $INITTAB"
+    if grep -q 'ttyS' "$INITTAB"; then
+        grep -n 'ttyS' "$INITTAB" | sed 's/^/      /'
+    else
+        echo "      ❌ inittab 中没有 ttyS 登录口 —— CONFIG_TARGET_SERIAL 未生效"
+    fi
+else
+    echo "    (未定位到 rootfs 的 /etc/inittab, 跳过该检查)"
+fi
+# 内核模块文件是否真的编出来了
+KVER=$(make -s kernelversion 2>/dev/null || true)
+if [ -n "$KVER" ]; then
+    echo "    内核版本       = $KVER"
+    find "bin/targets/x86/64" -path "*${KVER}*" \
+         \( -name 'intel_qat.ko*' -o -name 'qat_dh895xcc.ko*' \) 2>/dev/null | sed 's/^/      /' \
+         || echo "      (未找到 QAT 模块文件)"
+fi
 
 # ---------------------------------------------------------------------------
 # 8. 把产物复制到挂载点 /work/bin —— 容器销毁后仍可被 upload-artifact 取到

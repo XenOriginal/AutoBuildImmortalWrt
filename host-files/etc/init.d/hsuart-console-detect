@@ -1,0 +1,117 @@
+#!/bin/sh /etc/rc.common
+# ============================================================================
+# HSUART 内核控制台 —— 登录口自愈 + 拓扑记录
+#
+# 【要解决的问题】
+#   开启内核 8250_mid 后, HSUART (PCI 8086:19d8) 会落在一个 ttyS 编号上,
+#   具体编号取决于驱动探测顺序。编译期已按内核源码推导把
+#   CONFIG_TARGET_SERIAL 定为 ttyS4 (依据: 4 个 ISA 幽灵口占 0-3;
+#   drivers/tty/serial/8250/Makefile 中 8250_mid.o 在 8250_pci.o 之前,
+#   故 8250_mid 先取走 4/5/6, Intel ME KT 后移到 7)。
+#
+#   但"推导"不等于"实测"。若编号与编译期不一致, 后果是: grub 的 console=
+#   指向不存在的节点而静默失效, 且 /etc/inittab 里没有真实节点的登录口
+#   → 刷完机发现串口没有任何登录提示。
+#
+#   本服务在【每次启动】时按 /sys 反查真实编号:
+#     · 编号一致 → 什么都不做
+#     · 编号不同 → 自动补一条 inittab 登录口并让 init 重读
+#   ⇒ 不需要为了编号问题再刷一次机。
+#
+# 【判定方法】
+#   /sys/class/tty/ttySX/device 是指向该串口所属 PCI 设备的符号链接。
+#   取所有属于 8086:19d8 (Atom C3000 HSUART) 的 ttyS, 编号最小者即 UAR0,
+#   也就是本机的物理控制台口。
+#
+# 本服务幂等, 可重复执行。
+# ============================================================================
+START=95
+STOP=10
+
+INITTAB=/etc/inittab
+LOG=/etc/hsuart-console-detect.log
+HSUART_VENDOR=0x8086
+HSUART_DEVICE=0x19d8
+
+# 列出所有 Atom C3000 HSUART 的 PCI 设备真实路径
+huart_devices() {
+    for d in /sys/bus/pci/devices/*; do
+        [ -e "$d/vendor" ] || continue
+        [ "$(cat "$d/vendor" 2>/dev/null)" = "$HSUART_VENDOR" ] || continue
+        [ "$(cat "$d/device" 2>/dev/null)" = "$HSUART_DEVICE" ] || continue
+        readlink -f "$d"
+    done
+}
+
+# 输出 HSUART 对应的最小 ttyS 编号 (UAR0 = 物理控制台)
+detect_tty() {
+    local devs td found n
+    devs=$(huart_devices)
+    [ -n "$devs" ] || return 1
+
+    found=""
+    for t in /sys/class/tty/ttyS*; do
+        [ -e "$t" ] || continue
+        td=$(readlink -f "$t/device" 2>/dev/null) || continue
+        [ -n "$td" ] || continue
+        case " $devs " in
+            *" $td "*) found="$found ${t##*/}" ;;
+        esac
+    done
+    [ -n "$found" ] || return 1
+
+    for n in $found; do echo "${n#ttyS}"; done | sort -n | head -1 | sed 's/^/ttyS/'
+}
+
+record_topology() {
+    {
+        echo "=== $(date) hsuart-console-detect ==="
+        echo "--- nr_uarts ---"
+        cat /sys/module/8250/parameters/nr_uarts 2>/dev/null || echo "(不可读)"
+        echo "--- /proc/tty/driver/serial ---"
+        cat /proc/tty/driver/serial 2>/dev/null
+        echo "--- 8086:19d8 驱动绑定 ---"
+        for d in /sys/bus/pci/devices/*; do
+            [ -e "$d/device" ] || continue
+            [ "$(cat "$d/device" 2>/dev/null)" = "$HSUART_DEVICE" ] || continue
+            echo "  $(basename "$d") -> $(readlink "$d/driver" 2>/dev/null || echo '(未绑定)')"
+        done
+        echo "--- /proc/cmdline ---"
+        cat /proc/cmdline 2>/dev/null
+        echo "--- inittab 中的 ttyS 项 ---"
+        grep -n 'ttyS' "$INITTAB" 2>/dev/null || echo "  (无)"
+    } >>"$LOG" 2>&1
+}
+
+start() {
+    local tty
+    tty=$(detect_tty) || tty=""
+
+    record_topology
+
+    if [ -z "$tty" ]; then
+        logger -t hsuart-console "未检测到内核已接管的 HSUART (8086:19d8); 串口控制台可能不可用"
+        return 0
+    fi
+
+    logger -t hsuart-console "HSUART 实际节点: /dev/$tty"
+
+    if grep -qE "^${tty}::" "$INITTAB" 2>/dev/null; then
+        logger -t hsuart-console "inittab 已存在 $tty 登录口, 无需处理"
+        return 0
+    fi
+
+    # 编译期写入的编号与实际不一致 —— 补一条登录口, 并让 init 重读 inittab
+    {
+        echo "# hsuart-console-detect: 编译期 CONFIG_TARGET_SERIAL 与实际编号不符, 自动补齐"
+        echo "${tty}::askfirst:/usr/libexec/login.sh"
+    } >>"$INITTAB"
+    kill -HUP 1 2>/dev/null
+
+    logger -t hsuart-console "已自动补充 inittab 登录口: $tty"
+}
+
+stop() {
+    # 登录口保留 (移除它会使串口失去登录能力); 本服务无需停止动作
+    return 0
+}
