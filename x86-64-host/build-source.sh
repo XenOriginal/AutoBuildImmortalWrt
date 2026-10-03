@@ -479,13 +479,34 @@ for kv in CONFIG_IKCONFIG=y CONFIG_IKCONFIG_PROC=y; do
     echo "    + $kv"
 done
 
-# 内核合并结果断言 —— 把"配置没生效"从'3 小时后才知道'提前到'prepare 阶段即失败'
-# verify_serial_kconfig <内核构建目录> <阶段标签>
-verify_serial_kconfig() {
-    local kdir="$1" label="$2" kcfg="$1/.config" bad=0 want got sym
-    echo ">>> 校验内核串口配置 ($label): $kcfg"
+# ---------------------------------------------------------------------------
+# 5.8 内核合并结果断言 —— 两道闸门
+#
+# 【为什么不能在 prepare 之后查】
+#   实测(成功运行 35557214648 的日志):
+#     03:28:58  prepare 完成
+#     03:29:01  脚本里 step2 的 olddefconfig "完成"   ← 此时 $KDIR/.config 尚不存在
+#     04:11:36  OpenWrt 才真正调用 kconfig.pl 生成 .config.target  ← 整整晚 43 分钟
+#   即"合并后的内核 .config"是 OpenWrt 在 make world 中途才产出的。
+#   在 prepare 后断言它只会拿到"文件不存在"的假失败 —— 本脚本第一版正是
+#   这样误杀了一次构建 (run 37100787247), 教训记在这里。
+#
+# 【闸门 1 — 注入后立即执行, 最快】
+#   直接调用【上游真实的 scripts/kconfig.pl】, 用与 OpenWrt 完全相同的调用形状
+#   合并三份 target config 并断言。既早于长时间编译, 又用的是真脚本而非模拟。
+#   OpenWrt 实际命令(取自成功运行日志):
+#     scripts/kconfig.pl + + generic/config-6.12 x86/config-6.12 x86/64/config-6.12
+#
+# 【闸门 2 — make world 之后, 才是真凭据】
+#   断言内核最终 .config; 不通过则以失败收场, 使产物【不会被上传】。
+#   宁可这一次不出固件, 也不出一个没有串口驱动的固件。
+# ---------------------------------------------------------------------------
+verify_symbols_in() {
+    local kcfg="$1" label="$2" bad=0 want got sym
+    echo ">>> 校验内核串口配置 ($label)"
+    echo "    文件: $kcfg"
     if [ ! -f "$kcfg" ]; then
-        echo "    ❌ 内核 .config 不存在, 无法校验"
+        echo "    ❌ 配置文件不存在, 无法校验"
         return 1
     fi
     for sym in CONFIG_SERIAL_8250_MID CONFIG_HSU_DMA \
@@ -495,9 +516,8 @@ verify_serial_kconfig() {
             *NR_UARTS|*RUNTIME_UARTS) want=16 ;;
             *)                        want=y  ;;
         esac
-        # 注意: 顶层开了 set -o pipefail, 符号缺失时 grep 会返回 1,
-        # 若不加 '|| true' 则赋值语句本身失败, 会被 set -e 直接中止 ——
-        # 那样就看不到下面精心准备的诊断信息了。
+        # 顶层开了 set -o pipefail: 符号缺失时 grep 返回 1, 不加 '|| true'
+        # 则赋值本身失败会被 set -e 直接中止, 反而看不到下面的诊断。
         got=$(grep -E "^${sym}=" "$kcfg" 2>/dev/null | head -1 | cut -d= -f2- || true)
         if [ "$got" = "$want" ]; then
             echo "    ✅ ${sym}=${got}"
@@ -507,15 +527,30 @@ verify_serial_kconfig() {
         fi
     done
     if [ "$bad" -ne 0 ]; then
-        echo "!!! 串口控制台内核配置未生效 (可能被 generic config 覆盖)"
-        echo "--- 合并结果中的相关行 ---"
-        grep -nE "SERIAL_8250_MID|HSU_DMA|SERIAL_8250_NR_UARTS|SERIAL_8250_RUNTIME_UARTS" "$kcfg" || true
+        echo "!!! 串口控制台内核配置未生效"
+        echo "--- 该配置中的相关行 ---"
+        grep -nE "SERIAL_8250_MID|HSU_DMA|SERIAL_8250_NR_UARTS|SERIAL_8250_RUNTIME_UARTS|IKCONFIG" "$kcfg" || true
         echo "--- 子目标 config 中的相关行 ---"
-        grep -nE "SERIAL_8250_MID|HSU_DMA|SERIAL_8250_NR_UARTS|SERIAL_8250_RUNTIME_UARTS" "$SUB_CONFIG" || true
+        grep -nE "SERIAL_8250_MID|HSU_DMA|SERIAL_8250_NR_UARTS|SERIAL_8250_RUNTIME_UARTS|IKCONFIG" "$SUB_CONFIG" || true
         return 1
     fi
     return 0
 }
+
+echo ">>> 闸门 1: 用上游真实 kconfig.pl 预演合并 (与 OpenWrt 同形状)"
+MERGED_CHECK="/tmp/.config.target.precheck"
+if perl "$SRC_DIR/scripts/kconfig.pl" + + \
+        "$SRC_DIR/target/linux/generic/config-6.12" \
+        "$SRC_DIR/target/linux/x86/config-6.12" \
+        "$SRC_DIR/target/linux/x86/64/config-6.12" >"$MERGED_CHECK" 2>"$MERGED_CHECK.err"; then
+    verify_symbols_in "$MERGED_CHECK" "kconfig.pl 预演合并结果" || {
+        echo "!!! 提前终止: 子目标 config 未能覆盖 generic"
+        exit 1
+    }
+else
+    echo "    ⚠️ kconfig.pl 预演执行失败, 跳过闸门 1 (闸门 2 仍会兜底)"
+    tail -5 "$MERGED_CHECK.err" 2>/dev/null || true
+fi
 
 # ---------------------------------------------------------------------------
 # 5.5 【确定性方案】prepare → oldconfig 落盘 → 验证 → 再编译
@@ -562,12 +597,6 @@ if [ ! -f "$KDIR/Makefile" ]; then
 fi
 echo "    内核目录: $KDIR"
 
-# 尽早断言串口配置已合入 —— 不通过就地失败, 不浪费后面 1.5-3 小时
-verify_serial_kconfig "$KDIR" "prepare 后" || {
-    echo "!!! 提前终止: 串口控制台配置未生效"
-    exit 1
-}
-
 echo ">>> 步骤 2/3: 落盘内核配置 (olddefconfig / yes '' | make oldconfig)..."
 # 注意: 顶层开启了 set -o pipefail。
 # 当 make oldconfig 写入配置并关闭 stdin 后, yes 写入 broken pipe 会产生 SIGPIPE (退出码 141)。
@@ -596,12 +625,6 @@ else
     exit 1
 fi
 
-# 落盘后再复核一次 —— olddefconfig 理论上不会改动这些符号, 但必须证明而非假设
-verify_serial_kconfig "$KDIR" "olddefconfig 后" || {
-    echo "!!! 提前终止: 内核配置定型后串口符号丢失"
-    exit 1
-}
-
 echo ">>> 开始编译 (日志: $LOG)..."
 export CI=1
 export DEBIAN_FRONTEND=noninteractive
@@ -611,6 +634,23 @@ if ! make -j"$(nproc)" V=s </dev/null 2>&1 | tee -a "$LOG"; then
     echo "!!! 编译失败, 最后 150 行日志:"
     tail -150 "$LOG"
     exit 1
+fi
+
+# ---------------------------------------------------------------------------
+# 6.5 【闸门 2】编译完成后断言内核最终 .config
+#
+#   OpenWrt 是在 make world 中途才用 kconfig.pl 产出内核 .config 的
+#   (实测: prepare 后 43 分钟), 所以真正的凭据只能在这里查。
+#   不通过就直接失败 —— 后续的产物复制与 artifact 上传都不会发生,
+#   宁可这一次不出固件, 也不流出没有串口驱动的固件。
+# ---------------------------------------------------------------------------
+if [ -n "${KDIR:-}" ] && [ -d "$KDIR" ]; then
+    verify_symbols_in "$KDIR/.config" "内核最终 .config (编译完成后)" || {
+        echo "!!! 串口控制台内核配置未进入最终 .config —— 拒绝产出固件"
+        exit 1
+    }
+else
+    echo "!!! 警告: 未记录到内核目录(KDIR), 跳过闸门 2"
 fi
 
 # ---------------------------------------------------------------------------
