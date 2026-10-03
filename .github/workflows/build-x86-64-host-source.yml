@@ -193,8 +193,9 @@ jobs:
           ls -la bin/targets/x86/64/kmods/*/ 2>/dev/null | grep -i qat || echo "(kmods 中未找到 qat)"
           echo
           echo "=== 串口控制台 (Atom C3000 HSUART) ==="
-          # 内核侧符号由 build-source.sh 在 prepare 后【两次断言】(见 5.6 / verify_serial_kconfig),
-          # 此处只复核最终 .config 里的 OpenWrt 层配置确实落盘。
+          # 内核侧符号由 build-source.sh 用【两道闸门】验证 (见其中 5.8 节):
+          #   闸门1 注入后用真实 kconfig.pl 预演合并; 闸门2 编译后断言内核最终 .config。
+          # 此处只复核 OpenWrt 层的三个配置项确实落进了最终 .config。
           if [ -f host-final.config ]; then
             grep -E '^CONFIG_(TARGET_SERIAL|GRUB_BAUDRATE|GRUB_BOOTOPTS)=' host-final.config \
               || echo "::error::host-final.config 中缺少串口控制台配置"

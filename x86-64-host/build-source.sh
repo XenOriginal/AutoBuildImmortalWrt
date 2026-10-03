@@ -682,13 +682,13 @@ else
     echo "    (未定位到 rootfs 的 /etc/inittab, 跳过该检查)"
 fi
 # 内核模块文件是否真的编出来了
-KVER=$(make -s kernelversion 2>/dev/null || true)
-if [ -n "$KVER" ]; then
-    echo "    内核版本       = $KVER"
-    find "bin/targets/x86/64" -path "*${KVER}*" \
-         \( -name 'intel_qat.ko*' -o -name 'qat_dh895xcc.ko*' \) 2>/dev/null | sed 's/^/      /' \
-         || echo "      (未找到 QAT 模块文件)"
-fi
+# 注意: 这里【不要】调用 `make kernelversion` —— 构建结束后在顶层 make 上下文
+# 里该目标会失败 (实测 run 37102181389 把 make 的报错整段打进了日志, 污染输出,
+# 还导致下面的 find 拿到垃圾版本号)。内核版本直接从内核目录名取。
+KVER=$(basename "${KDIR:-linux-unknown}" | sed 's/^linux-//')
+echo "    内核版本       = $KVER"
+echo "    (8250_mid / HSU_DMA / QAT 均为 =y 内建, 不会出现在 kmods 目录)"
+find "bin/targets/x86/64" -path "*${KVER}*" -name '*qat*.ko*' 2>/dev/null | sed 's/^/      /' || true
 
 # ---------------------------------------------------------------------------
 # 8. 把产物复制到挂载点 /work/bin —— 容器销毁后仍可被 upload-artifact 取到
