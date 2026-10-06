@@ -51,6 +51,58 @@ fi
 cd "$SRC_DIR"
 
 # ---------------------------------------------------------------------------
+# 1.5 注入宿主机自定义 rootfs 覆盖层 (files/)
+#
+# 【为什么必须在源码树里, 而不是 /work/files】
+#   工作流把宿主机调优文件组装到 $GITHUB_WORKSPACE/files/ 并只读挂载为
+#   /host-files。但 OpenWrt 只认【源码树根】下的 files/ 目录:
+#       include/image.mk 第 423 行:
+#           $(call prepare_rootfs,$(mkfs_cur_target_dir),$(TOPDIR)/files)
+#   本脚本的源码树在 /work/immortalwrt, 故 $(TOPDIR)/files 指的是
+#   /work/immortalwrt/files。工作流挂载出来的 /work/files 与 /host-files
+#   都不是 OpenWrt 会读取的位置 —— 不显式复制就等于静默丢弃全部调优文件。
+#
+# 【此前正是如此 (长期缺陷, 实测证据)】
+#   run 37102181389 产出的固件里:
+#     - /etc/sysctl.conf 仍是 154 字节的出厂占位文件 (BBR/TCP 调优全部丢失);
+#     - 不存在 /etc/init.d/host-zram、/etc/modules.d/40-qat、
+#       /etc/uci-defaults/99-host.sh、/etc/config/custom_router_ip.txt。
+#   即"固化宿主机手动调优 + 首启网络配置"这一整块完善项从未真正生效。
+#
+#   对照: ImageBuilder 工作流 (build-x86-64-host.yml) 是正确写法 ——
+#         它把 files/ 直接挂到 /home/build/immortalwrt/files。
+# ---------------------------------------------------------------------------
+echo ">>> 注入宿主机自定义 rootfs 覆盖层 (files/)..."
+if [ ! -d /host-files ]; then
+    echo "!!! 未挂载 /host-files —— 宿主机调优文件无法注入, 终止"
+    exit 1
+fi
+mkdir -p "$SRC_DIR/files"
+cp -a /host-files/. "$SRC_DIR/files/"
+# git 在 core.fileMode=false 的检出下会丢可执行位, 这里兜一层
+chmod +x "$SRC_DIR"/files/etc/init.d/* 2>/dev/null || true
+chmod +x "$SRC_DIR"/files/etc/uci-defaults/* 2>/dev/null || true
+echo "--- $SRC_DIR/files 内容 ---"
+find "$SRC_DIR/files" -mindepth 1 | sort
+
+# 硬断言: 关键文件缺一不可, 否则立刻失败 —— 宁可不编译, 也不出残缺固件
+for must in \
+    files/etc/sysctl.conf \
+    files/etc/modules.d/30-tcp-bbr \
+    files/etc/modules.d/40-qat \
+    files/etc/init.d/host-zram \
+    files/etc/init.d/hsuart-console-detect \
+    files/etc/uci-defaults/99-host.sh \
+    files/etc/uci-defaults/98-hsuart-kernel-console \
+    files/etc/config/custom_router_ip.txt; do
+    if [ ! -e "$SRC_DIR/$must" ]; then
+        echo "!!! 覆盖层缺少必需文件: $must"
+        exit 1
+    fi
+done
+echo "  OK: 覆盖层已注入并通过完整性断言"
+
+# ---------------------------------------------------------------------------
 # 2. 注入自定义 QAT 包
 # ---------------------------------------------------------------------------
 echo ">>> 注入 QAT 驱动包与固件包..."
@@ -229,15 +281,39 @@ CONFIG_PACKAGE_luci-proto-ppp=y
 "
 
 # ---- QAT 软件包 (内核符号由 KCONFIG 声明) ----
+#
+# 【必须是 =y, 不能是 =m —— 这是本工作流此前最严重的缺陷】
+#   OpenWrt 的 rootfs 安装凭据只对 CONFIG_PACKAGE_<pkg> == y 生成:
+#       include/package-pack.mk:
+#           ifeq ($(CONFIG_PACKAGE_$(1)),y)
+#             compile: $(PKG_INSTALL_STAMP).$(1)      # ← 只有 y 才打安装戳
+#           endif
+#   =m 只意味着"把 .apk 编出来放进 target packages 目录", 该包【不会】被
+#   安装进 rootfs。此前 QAT 三项写的正是 =m, 于是:
+#     - intel_qat.ko / qat_dh895xcc.ko / qat_dh895xccvf.ko / dh_generic.ko
+#       都不在固件的 /lib/modules 里;
+#     - /lib/firmware/qat_895xcc.bin 与 qat_895xcc_mmp.bin 也不存在。
+#   实测证据 (run 37102181389 产出的固件):
+#     - 权威清单 immortalwrt-x86-64-1024.manifest 共 398 个包, 其中
+#       【无任何 qat 包】(kmod-crypto-rng / kmod-mlx5-core / kmod-i40e 等
+#       写成 =y 的包则全部在列);
+#     - /lib/modules/6.12.108 下 244 个 .ko, 无一个 qat。
+#   即: 固件"启用了 QAT"只停留在编译产物层面, 刷进机器后机器上并没有 QAT。
+#
+#   注意区分两个不同层面的符号:
+#     CONFIG_PACKAGE_kmod-crypto-qat-*   ← 本处, 决定"装不装进固件" (=y)
+#     CONFIG_CRYPTO_DEV_QAT_*            ← qat-kmod/Makefile 的 KCONFIG, 决定
+#                                          "驱动编成模块还是内建" (=m, 保持=m)
+#   二者互不冲突: 驱动仍编成 .ko 模块, 但模块包会被装进固件。
 HOST_PKGS="$HOST_PKGS
-CONFIG_PACKAGE_kmod-crypto-qat-common=m
-CONFIG_PACKAGE_kmod-crypto-qat-dh895xcc=m
-CONFIG_PACKAGE_qat-firmware-dh895xcc=m
-CONFIG_PACKAGE_kmod-crypto-authenc=m
-CONFIG_PACKAGE_kmod-crypto-kpp=m
-CONFIG_PACKAGE_kmod-crypto-rng=m
-CONFIG_PACKAGE_kmod-crypto-rsa=m
-CONFIG_PACKAGE_kmod-lib-crc8=m
+CONFIG_PACKAGE_kmod-crypto-qat-common=y
+CONFIG_PACKAGE_kmod-crypto-qat-dh895xcc=y
+CONFIG_PACKAGE_qat-firmware-dh895xcc=y
+CONFIG_PACKAGE_kmod-crypto-authenc=y
+CONFIG_PACKAGE_kmod-crypto-kpp=y
+CONFIG_PACKAGE_kmod-crypto-rng=y
+CONFIG_PACKAGE_kmod-crypto-rsa=y
+CONFIG_PACKAGE_kmod-lib-crc8=y
 "
 
 # ---- Docker (可选) ----
@@ -262,13 +338,14 @@ echo "--- QAT 相关最终配置 (软件包层) ---"
 grep -iE "QAT" .config || echo "(警告: 未在 .config 中找到 QAT 配置)"
 
 # 校验【软件包】符号 (内核符号由 KernelPackage KCONFIG 保证, 不在此校验)
+# 期望值必须是 y —— 见上文 =y/=m 语义说明; =m 会让固件里没有 QAT。
 missing=0
 for sym in CONFIG_PACKAGE_kmod-crypto-qat-common \
            CONFIG_PACKAGE_kmod-crypto-qat-dh895xcc \
            CONFIG_PACKAGE_qat-firmware-dh895xcc; do
     val=$(grep -E "^${sym}=" .config | head -1 | cut -d= -f2)
-    if [ "$val" != "m" ]; then
-        echo "!!! 错误: $sym 期望 'm', 实际 '${val:-未设置}'"
+    if [ "$val" != "y" ]; then
+        echo "!!! 错误: $sym 期望 'y' (装进固件), 实际 '${val:-未设置}'"
         missing=1
     else
         echo "  OK: $sym=$val"
@@ -654,6 +731,79 @@ else
 fi
 
 # ---------------------------------------------------------------------------
+# 6.6 【闸门 3】断言 QAT 真的进了固件 —— 读权威清单 .manifest
+#
+#   为什么需要这一道:
+#     =m 与 =y 的差别只体现在"装不装进 rootfs"上, 而编译日志里两者都会
+#     打印出 .apk 制品, 光看日志会误判为成功 (此前就是这么误判了几个月的)。
+#     .manifest 由 apk list --manifest 从【实际安装库】生成, 是唯一权威凭据。
+#   历史教训: run 37102181389 的清单 398 个包里没有任何 qat 包。
+# ---------------------------------------------------------------------------
+echo ">>> 闸门 3: 断言 QAT 已真正安装进固件 (读 .manifest)"
+# 优先取与本构建 PROFILE 同名的那份清单 (immortalwrt-x86-64-<PROFILE>.manifest)
+MANIFEST=$(ls -1 "$SRC_DIR"/bin/targets/x86/64/*-"${PROFILE}".manifest 2>/dev/null | head -1 || true)
+[ -n "$MANIFEST" ] || MANIFEST=$(ls -1 "$SRC_DIR"/bin/targets/x86/64/*.manifest 2>/dev/null | head -1 || true)
+if [ -z "$MANIFEST" ]; then
+    echo "!!! 未找到固件清单 (.manifest), 无法证明 QAT 已安装 —— 拒绝产出固件"
+    exit 1
+fi
+echo "    清单: $MANIFEST ($(wc -l < "$MANIFEST") 个包)"
+qat_missing=0
+for pkg in kmod-crypto-qat-common kmod-crypto-qat-dh895xcc qat-firmware-dh895xcc; do
+    if grep -qE "^${pkg} " "$MANIFEST"; then
+        echo "    ✅ ${pkg} 已在固件内"
+    else
+        echo "    ❌ ${pkg} 不在固件清单中 —— 只编译未安装 (检查 CONFIG_PACKAGE_* 是否为 y)"
+        qat_missing=1
+    fi
+done
+if [ "$qat_missing" -ne 0 ]; then
+    echo "!!! QAT 未进入固件 —— 拒绝产出固件"
+    exit 1
+fi
+
+# ---------------------------------------------------------------------------
+# 6.7 【闸门 4】断言宿主机覆盖层与 QAT 驱动文件落在 rootfs 暂存区
+#
+#   闸门 3 只能证明"包被安装了", 不能证明"files/ 覆盖层被 prepare_rootfs 应用"。
+#   这里直接在暂存 rootfs 里找文件本体; 若无暂存目录则降级为警告。
+# ---------------------------------------------------------------------------
+echo ">>> 闸门 4: 断言宿主机覆盖层与 QAT 驱动文件已落在 rootfs 暂存区"
+ROOTFS_DIRS=$(find "$SRC_DIR/build_dir" -maxdepth 2 -type d \
+    \( -name 'root-x86' -o -name 'root.orig-x86' \) 2>/dev/null || true)
+ROOTFS_SEEN=0
+ROOTFS_OK=0
+for rd in $ROOTFS_DIRS; do
+    [ -d "$rd" ] || continue
+    ROOTFS_SEEN=1
+    miss=""
+    for f in etc/init.d/host-zram etc/init.d/hsuart-console-detect \
+             etc/modules.d/40-qat etc/uci-defaults/99-host.sh \
+             etc/uci-defaults/98-hsuart-kernel-console \
+             etc/config/custom_router_ip.txt \
+             lib/firmware/qat_895xcc.bin; do
+        [ -e "$rd/$f" ] || miss="$miss $f"
+    done
+    # sysctl.conf 必须是我们的版本 (含 BBR), 而不是 154 字节的出厂占位文件
+    grep -q '^net.ipv4.tcp_congestion_control=bbr' "$rd/etc/sysctl.conf" 2>/dev/null \
+        || miss="$miss etc/sysctl.conf(无BBR)"
+    # QAT 内核模块本体
+    ls "$rd"/lib/modules/*/intel_qat.ko >/dev/null 2>&1 || miss="$miss lib/modules/*/intel_qat.ko"
+    if [ -z "$miss" ]; then
+        echo "    ✅ $rd 已包含覆盖层与 QAT 驱动"
+        ROOTFS_OK=1
+    else
+        echo "    (未通过 $rd, 缺少:$miss )"
+    fi
+done
+if [ "$ROOTFS_SEEN" -eq 0 ]; then
+    echo "    ⚠️ 未定位到 rootfs 暂存目录, 跳过闸门 4 (闸门 3 的清单断言仍然有效)"
+elif [ "$ROOTFS_OK" -eq 0 ]; then
+    echo "!!! 覆盖层 / QAT 驱动未进入 rootfs —— 拒绝产出固件"
+    exit 1
+fi
+
+# ---------------------------------------------------------------------------
 # 7. 产物
 # ---------------------------------------------------------------------------
 echo ">>> 编译完成, 产物列表:"
@@ -677,6 +827,8 @@ if [ -n "$INITTAB" ] && [ -f "$INITTAB" ]; then
         grep -n 'ttyS' "$INITTAB" | sed 's/^/      /'
     else
         echo "      ❌ inittab 中没有 ttyS 登录口 —— CONFIG_TARGET_SERIAL 未生效"
+        echo "!!! 串口登录口缺失 —— 拒绝产出固件"
+        exit 1
     fi
 else
     echo "    (未定位到 rootfs 的 /etc/inittab, 跳过该检查)"
@@ -687,8 +839,9 @@ fi
 # 还导致下面的 find 拿到垃圾版本号)。内核版本直接从内核目录名取。
 KVER=$(basename "${KDIR:-linux-unknown}" | sed 's/^linux-//')
 echo "    内核版本       = $KVER"
-echo "    (8250_mid / HSU_DMA / QAT 均为 =y 内建, 不会出现在 kmods 目录)"
-find "bin/targets/x86/64" -path "*${KVER}*" -name '*qat*.ko*' 2>/dev/null | sed 's/^/      /' || true
+# 8250_mid / HSU_DMA 是内核内建 (=y), 不会出现在 kmods 目录;
+# QAT 是模块 (=m 编成 .ko), 已由闸门 3/4 断言装进固件, 这里只做展示。
+find "bin/targets/x86/64" -path "*${KVER}*" \( -name '*qat*.ko*' -o -name '*qat*.apk' \) 2>/dev/null | sed 's/^/      /' || true
 
 # ---------------------------------------------------------------------------
 # 8. 把产物复制到挂载点 /work/bin —— 容器销毁后仍可被 upload-artifact 取到

@@ -183,6 +183,7 @@ jobs:
 
       - name: Verify QAT and tuning in output
         run: |
+          set -e
           echo "=== 构建产物 ==="
           ls -lah bin/targets/x86/64/ 2>/dev/null || true
           echo
@@ -191,19 +192,61 @@ jobs:
           echo
           echo "=== 内核模块包 ==="
           ls -la bin/targets/x86/64/kmods/*/ 2>/dev/null | grep -i qat || echo "(kmods 中未找到 qat)"
+
+          # ------------------------------------------------------------------
+          # 【权威断言】QAT 是否真的装进了固件
+          #   .apk 出现在 bin/targets/.../packages/ 只证明"编译出来了",
+          #   不证明"装进 rootfs" —— CONFIG_PACKAGE_*=m 就是只编不装。
+          #   .manifest 由 apk list --manifest 从实际安装库生成, 是唯一凭据。
+          #   (历史缺陷: 2026-10-03 的 run 37102181389 清单里没有任何 qat 包)
+          # ------------------------------------------------------------------
+          echo
+          echo "=== QAT 是否在固件清单 (.manifest) 内 ==="
+          MANIFEST=$(ls -1 bin/targets/x86/64/*-"${{ github.event.inputs.profile }}".manifest 2>/dev/null | head -1)
+          [ -n "$MANIFEST" ] || MANIFEST=$(ls -1 bin/targets/x86/64/*.manifest 2>/dev/null | head -1)
+          if [ -z "$MANIFEST" ]; then
+            echo "::error::未找到 .manifest, 无法证明 QAT 已安装"
+            exit 1
+          fi
+          echo "清单: $MANIFEST ($(wc -l < "$MANIFEST") 个包)"
+          MISS=0
+          for pkg in kmod-crypto-qat-common kmod-crypto-qat-dh895xcc qat-firmware-dh895xcc; do
+            if grep -qE "^${pkg} " "$MANIFEST"; then
+              echo "  ✅ $pkg"
+            else
+              echo "::error::$pkg 不在固件清单中 —— 只编译未安装"
+              MISS=1
+            fi
+          done
+          [ "$MISS" -eq 0 ] || exit 1
+
           echo
           echo "=== 串口控制台 (Atom C3000 HSUART) ==="
-          # 内核侧符号由 build-source.sh 用【两道闸门】验证 (见其中 5.8 节):
+          # 内核侧符号由 build-source.sh 的【两道闸门】验证 (见其 5.8 节):
           #   闸门1 注入后用真实 kconfig.pl 预演合并; 闸门2 编译后断言内核最终 .config。
           # 此处只复核 OpenWrt 层的三个配置项确实落进了最终 .config。
           if [ -f host-final.config ]; then
             grep -E '^CONFIG_(TARGET_SERIAL|GRUB_BAUDRATE|GRUB_BOOTOPTS)=' host-final.config \
-              || echo "::error::host-final.config 中缺少串口控制台配置"
+              || { echo "::error::host-final.config 中缺少串口控制台配置"; exit 1; }
           else
-            echo "::warning::未找到 host-final.config, 无法复核串口配置"
+            echo "::error::未找到 host-final.config, 无法复核串口配置"
+            exit 1
           fi
-          echo "--- 固件内含的串口相关内核模块 (8250_mid/HSU_DMA 为 =y 内建, 不会出现在 kmods) ---"
+
+          # ------------------------------------------------------------------
+          # 【权威断言】宿主机调优覆盖层是否真的进了 rootfs
+          #   files/ 必须被复制进源码树 ($(TOPDIR)/files), 否则静默丢弃。
+          #   (历史缺陷: 挂载为 /host-files 但脚本从不引用, 调优全部丢失)
+          # ------------------------------------------------------------------
+          echo
+          echo "=== 宿主机调优覆盖层是否在固件清单对应镜像内 ==="
+          echo "--- 内核版本与 QAT 模块本体 (从镜像内提取, 若可用) ---"
           find bin/ -iname '*8250*' -o -iname '*hsu*' 2>/dev/null | head || true
+          for f in etc/init.d/host-zram etc/modules.d/40-qat etc/uci-defaults/99-host.sh; do
+            echo "  期望存在于 rootfs: /$f"
+          done
+          echo "  (rootfs 内的最终断言由 build-source.sh 的闸门 4 完成;"
+          echo "   此处仅回显, 供人工比对)"
 
       - name: Upload firmware
         uses: actions/upload-artifact@v4
@@ -215,5 +258,9 @@ jobs:
             bin/targets/x86/64/*.manifest
             bin/targets/x86/64/sha256sums
             bin/targets/x86/64/kmods/**/*qat*
+            # 便于事后复核与离线重装 (固件内已含这些模块)
+            host-final.config
+            bin/targets/x86/64/packages/*qat*.apk
+            bin/packages/x86_64/base/qat-*.apk
           if-no-files-found: warn
           retention-days: 30
