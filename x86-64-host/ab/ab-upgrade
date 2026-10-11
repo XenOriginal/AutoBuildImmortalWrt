@@ -40,10 +40,14 @@ done
 [ -n "$IMAGE" ] || ab_die "用法: ab-upgrade <combined 镜像[.gz]> [--no-overlay] [--yes]"
 [ -f "$IMAGE" ] || ab_die "镜像不存在: $IMAGE"
 command -v grub-editenv >/dev/null 2>&1 || ab_die "缺少 grub-editenv (请启用特性片段 17-grub-ab)"
+
+# 必须先确保 /boot 就位: 设备侧工具不能假设 fstab 已经把 /boot 挂好
+# (实测: 官方镜像在 QEMU 里 /boot 就是未挂载状态, grubenv 自然找不到)
+ab_ensure_boot || ab_die "无法挂载 /boot (找不到 LABEL=kernel 的分区?)"
 [ -f "$AB_ENV" ] || ab_die "缺少 $AB_ENV (本机不是 A/B 布局?)"
 
 BOOT_DEV=$(ab_boot_dev)
-[ -n "$BOOT_DEV" ] || ab_die "/boot 未挂载"
+[ -n "$BOOT_DEV" ] || ab_die "/boot 不可用"
 DISK=$(ab_disk_dev)
 set -- $(ab_slot_devs)
 SLOT_A_DEV=$1; SLOT_B_DEV=$2

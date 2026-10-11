@@ -11,9 +11,10 @@ set -eu
 VERBOSE=0
 [ "${1:-}" = "-v" ] && VERBOSE=1
 
+ab_ensure_boot || true
 BOOT_DEV=$(ab_boot_dev)
 DISK=$(ab_disk_dev)
-[ -n "$BOOT_DEV" ] || ab_die "/boot 未挂载 —— 本机不是 A/B 布局?"
+[ -n "$BOOT_DEV" ] || ab_die "找不到 /boot (LABEL=kernel) —— 本机不是 A/B 布局?"
 
 set -- $(ab_slot_devs)
 SLOT_A_DEV=$1; SLOT_B_DEV=$2

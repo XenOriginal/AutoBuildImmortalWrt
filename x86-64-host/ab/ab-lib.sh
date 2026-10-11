@@ -25,7 +25,28 @@ ab_partdev() { # $1=disk $2=num
     return 1
 }
 
-ab_boot_dev() { awk '$2=="/boot"{print $1; exit}' /proc/mounts 2>/dev/null; }
+ab_boot_mounted() { awk '$2=="/boot"{found=1} END{exit !found}' /proc/mounts 2>/dev/null; }
+
+# /boot 分区: 先看挂载表, 再按 LABEL=kernel 兜底找 (不能假设 fstab 一定有 /boot)
+ab_boot_dev() {
+    d=$(awk '$2=="/boot"{print $1; exit}' /proc/mounts 2>/dev/null)
+    [ -n "$d" ] && { echo "$d"; return 0; }
+    for b in /dev/sd*[0-9] /dev/hd*[0-9] /dev/vd*[0-9] /dev/nvme*p[0-9] /dev/mmcblk*p[0-9]; do
+        [ -b "$b" ] || continue
+        [ "$(blkid -s LABEL -o value "$b" 2>/dev/null)" = "kernel" ] && { echo "$b"; return 0; }
+    done
+    return 1
+}
+
+# 确保 /boot 已挂载 (设备侧工具不能依赖 fstab 恰好挂好了它)
+ab_ensure_boot() {
+    ab_boot_mounted && return 0
+    b=$(ab_boot_dev) || return 1
+    mkdir -p /boot
+    mount -t vfat "$b" /boot 2>/dev/null || mount "$b" /boot 2>/dev/null || return 1
+    return 0
+}
+
 ab_disk_dev() { ab_strip_part "$(ab_boot_dev)"; }
 
 # 读取设备的十六进制字节 (长度 len, 起始 offset)
