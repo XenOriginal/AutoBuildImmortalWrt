@@ -165,6 +165,9 @@ for f in usr/sbin/ab-upgrade usr/sbin/ab-status usr/lib/ab-lib.sh \
 done
 echo "  OK: A/B 工具已就位 (含 /etc/rc.d/S95ab-bootok 自启链接)"
 
+# 既有脚本里缺 rc.d 自启链接的补上 (host-zram 之前既没链接、shebang 也不对)
+ln -sf ../init.d/host-zram "$SRC_DIR/files/etc/rc.d/S15host-zram"
+
 # ---------------------------------------------------------------------------
 # 1.7 安装硬件适配工具 (看门狗 + 健康巡检)
 #
@@ -183,6 +186,11 @@ for f in etc/init.d/hw-watchdog etc/init.d/hw-healthd usr/sbin/hw-health \
     [ -e "$SRC_DIR/files/$f" ] || { echo "!!! 硬件适配工具安装失败: $f"; exit 1; }
 done
 echo "  OK: 硬件适配工具已就位 (S96hw-watchdog / S97hw-healthd)"
+
+install -m 0755 "$SCRIPT_DIR/hw/hw-tune" "$SRC_DIR/files/etc/init.d/hw-tune"
+ln -sf ../init.d/hw-tune "$SRC_DIR/files/etc/rc.d/S98hw-tune"
+[ -e "$SRC_DIR/files/etc/init.d/hw-tune" ] || { echo "!!! hw-tune 安装失败"; exit 1; }
+echo "  OK: 运行期调优脚本已就位 (S98hw-tune)"
 
 # ---------------------------------------------------------------------------
 # 2. 注入自定义 QAT 包

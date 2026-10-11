@@ -10,8 +10,7 @@
 # ============================================================================
 
 START=97
-STOP=03
-USE_PROCD=0
+STOP=3
 
 INTERVAL=${AB_HEALTH_INTERVAL:-900}   # 默认 15 分钟
 PID=/var/run/hw-healthd.pid

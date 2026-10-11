@@ -113,6 +113,42 @@ USB 盘 `sdb` 无 SMART 结论（U 盘通常不支持，这也是应尽快迁移
 iTCO 常用 2×阈值 ≈ 20s，故喂狗间隔取 5s 留足余量。`kill -9` 喂狗进程会跳过
 魔数关闭 → 硬件超时后重启机器，这是看门狗的设计语义而非缺陷。
 
+### 4.4c 内核 / 虚拟化 / 网络栈调优现状（实测口径）
+
+**虚拟化（KVM 宿主）**
+
+| 项 | 状态 |
+| --- | --- |
+| KVM 硬件特性 | ✅ `ept/vpid/unrestricted_guest/enable_apicv` 全 Y；`nested=Y`；`vmentry_l1d_flush=not required` |
+| vhost-net / VFIO | ✅ 随特性片段 10-kvm-host / 15-iommu-vtd 装入 |
+| VT-d | ✅ `intel_iommu=on iommu=pt` 写入命令行（BIOS 打开 VT-d 即生效） |
+| **透明大页 THP** | ❌ 基线 `not set` → **本次补齐**（特性片段 45-kvm-net-perf，运行期默认 madvise） |
+| **HugeTLBFS** | ❌ 基线 `not set` → **本次补齐**（QEMU `-mem-path /dev/hugepages` 可预分配大页） |
+| 缓解措施 | 实测 `meltdown/l1tf/mds = Not affected`（Goldmont），仅 spectre_v2 用 Retpolines；**不做 `mitigations=off`**（收益小、风险大） |
+
+**网络栈**
+
+| 项 | 状态 |
+| --- | --- |
+| 拥塞控制 | ✅ 运行中就是 `bbr`（可用：reno cubic bbr） |
+| 默认队列 | ✅ `fq_codel`（基线已内建 `NET_SCH_FQ_CODEL` + `DEFAULT_FQ_CODEL=y`） |
+| TCP Fast Open | ✅ `tcp_fastopen=3`；`tcp_slow_start_after_idle=0`；`tcp_mtu_probing=1`；`tcp_tw_reuse=2` |
+| 收发缓冲 | ✅ rmem/wmem 上限 16 MiB |
+| **队列算法能力** | ❌ 基线无 `sch_fq`/`sch_cake` → **本次补齐能力**（不改默认队列） |
+| **转发 UDP GRO** | ❌ 实测 eth1/eth2 支持但默认关 → **本次默认开启**（`hw-tune`，sysctl 覆盖不到） |
+| **突发/端口/队列** | ❌ 未设 → **本次补齐**：`netdev_max_backlog=16384`、`ip_local_port_range` 放宽、`somaxconn=8192`、`tcp_max_syn_backlog=8192`、`tcp_notsent_lowat=128K`（BBR 延迟优化） |
+| 加密加速 | ✅ AES-NI 内建 `=y`；`kmod-crypto-sha256` 在 x86_64 上带 `sha256-ssse3.ko`（SHA-NI）；GHASH/CRC32C 随片段 20-crypto-accel |
+| ECN / default_qdisc=fq | ⏸ 属策略取舍，写在 `sysctl.conf` 注释项里，需要时一行开启 |
+| NIC 硬件 TC 卸载 | ❌ 刻意不做（WAN 是 PPPoE，主路径覆盖不到；见 ab/README.md） |
+
+**CPU / 电源**
+
+| 项 | 状态 |
+| --- | --- |
+| 调频 | 当前 `schedutil`（驱动 acpi-cpufreq；可选 ondemand/performance） |
+| 切换方式 | `/etc/hw-tune.conf` 里设 `CPU_GOVERNOR=performance`（默认不动，避免无依据地改功耗/温度曲线） |
+| HZ | 100（可选片段 40-net-tune 切 250，需实测收益） |
+
 ### 4.5 UEFI / Legacy 双启动：已就绪，切换属运维动作
 
 - 两种启动方式共用同一套 GRUB 生成逻辑（`target/linux/x86/image/Makefile` 的 `Build/grub-config`），故**串口控制台与 `CONFIG_GRUB_BOOTOPTS`（含新增的 `intel_iommu=on iommu=pt`）在 UEFI 下同样生效**；`CONFIG_EFI_PARTITION=y` 已内建。

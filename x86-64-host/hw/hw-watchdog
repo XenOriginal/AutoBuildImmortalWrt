@@ -19,8 +19,7 @@
 # ============================================================================
 
 START=96
-STOP=04
-USE_PROCD=0
+STOP=4
 
 DEV=/dev/watchdog
 LOG=/etc/hw-watchdog.log

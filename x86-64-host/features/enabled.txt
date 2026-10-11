@@ -27,3 +27,6 @@
 
 # 硬件适配补全: 看门狗(挂死自动重启) + 温度/SSD 健康巡检
 35-hw-health
+
+# 虚拟化内核调优(THP/HugeTLB) + 网络队列算法能力(sch_fq/sch_cake)
+45-kvm-net-perf

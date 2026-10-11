@@ -22,7 +22,6 @@
 
 START=95
 STOP=10
-USE_PROCD=0
 
 AB_LOG=/etc/ab.log
 AB_ENV=/boot/grub/grubenv
