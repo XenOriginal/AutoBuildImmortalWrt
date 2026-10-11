@@ -1,0 +1,54 @@
+#!/bin/sh
+# ============================================================================
+# A/B 状态查看
+#   ab-status          基础状态 (当前槽 / grubenv / 内核 / overlay)
+#   ab-status -v       额外显示分区布局与最近日志
+# ============================================================================
+set -eu
+
+. /usr/lib/ab-lib.sh
+
+VERBOSE=0
+[ "${1:-}" = "-v" ] && VERBOSE=1
+
+BOOT_DEV=$(ab_boot_dev)
+DISK=$(ab_disk_dev)
+[ -n "$BOOT_DEV" ] || ab_die "/boot 未挂载 —— 本机不是 A/B 布局?"
+
+set -- $(ab_slot_devs)
+SLOT_A_DEV=$1; SLOT_B_DEV=$2
+
+CUR=$(ab_current_slot "$SLOT_A_DEV" "$SLOT_B_DEV" 2>/dev/null || echo unknown)
+
+echo "===== A/B 状态 ====="
+echo "磁盘        : ${DISK:-未知}"
+echo "启动槽      : $CUR   (内核命令行: $(tr ' ' '\n' < /proc/cmdline | sed -n 's/^root=PARTUUID=//p'))"
+echo
+printf "槽 A        : %s  PARTUUID=%s\n" "${SLOT_A_DEV:-无}" "$(blkid -s PARTUUID -o value "${SLOT_A_DEV:-/nonexistent}" 2>/dev/null || echo -)"
+printf "槽 B        : %s  PARTUUID=%s\n" "${SLOT_B_DEV:-无}" "$(blkid -s PARTUUID -o value "${SLOT_B_DEV:-/nonexistent}" 2>/dev/null || echo -)"
+echo
+echo "内核        :"
+for f in /boot/vmlinuz.a /boot/vmlinuz.b; do
+    [ -f "$f" ] && printf "  %-18s %s 字节  %s\n" "$f" "$(stat -c%s "$f")" "$(date -r "$f" '+%Y-%m-%d %H:%M' 2>/dev/null || true)"
+done
+echo
+echo "grubenv ($AB_ENV):"
+if [ -f "$AB_ENV" ]; then
+    grub-editenv "$AB_ENV" list 2>/dev/null | sed 's/^/  /'
+    case "$(ab_env_get boot_ok)" in
+        1) echo "  => 上次启动已被标记成功 (回滚计数归零)" ;;
+        *) echo "  => 注意: boot_ok != 1, 说明当前槽尚未被 ab-bootok 确认" ;;
+    esac
+else
+    echo "  (不存在)"
+fi
+echo
+echo "overlay     : $(ab_overlay_dir)"
+[ "$VERBOSE" = 1 ] && {
+    echo
+    echo "分区布局:"
+    parted -s -m "$DISK" unit MiB print 2>/dev/null | awk -F: '/^[0-9]+:/{printf "  p%s  %9s MiB  %s\n", $1, $4, $6}'
+    echo
+    echo "最近 A/B 日志 ($AB_LOG):"
+    tail -20 "$AB_LOG" 2>/dev/null | sed 's/^/  /' || echo "  (无)"
+}

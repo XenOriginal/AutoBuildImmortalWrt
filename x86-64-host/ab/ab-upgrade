@@ -1,0 +1,158 @@
+#!/bin/sh
+# ============================================================================
+# A/B 安全自升级 —— 把新固件写入【非活动槽】
+#
+#   用法: ab-upgrade <combined 镜像[.gz]> [--no-overlay] [--yes]
+#
+# 流程:
+#   1. 判定当前槽 -> 目标槽 (另一槽)
+#   2. 从镜像 p1 取内核 -> /boot/vmlinuz.<目标槽>
+#   3. 镜像 p2 (squashfs) -> 目标槽分区
+#   4. 迁移 overlay: 在目标槽分区内按 OpenWrt 的偏移建 f2fs 并复制当前 /overlay
+#      (偏移 = squashfs bytes_used 向上 4KiB 对齐, 实测依据见 README 第五节)
+#   5. grubenv: next_entry=<目标槽> boot_ok=0 bootcount=0  (一次性引导 + 失败回滚)
+#
+# 【为什么必须迁移 overlay】OpenWrt x86 的 overlay 在每个槽分区内部, 不迁移
+# 则新槽首次启动是【空配置】(默认网络), 健康检查必然失败并触发回滚 —— 升级
+# 永远无法成功。迁移后新槽带着当前配置起, 且回滚时旧槽配置原样保留。
+#
+# 【回滚】新槽连续两次没被 ab-bootok 标记成功 -> GRUB 自动切回旧槽。
+#         也可人工锁定:  grub-editenv /boot/grub/grubenv set boot_ok=1
+# ============================================================================
+set -eu
+
+. /usr/lib/ab-lib.sh
+
+IMAGE=""
+MIGRATE=1
+ASSUME=0
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --no-overlay) MIGRATE=0; shift ;;
+        --yes) ASSUME=1; shift ;;
+        -h|--help) sed -n '2,20p' "$0"; exit 0 ;;
+        -*) ab_die "未知参数: $1" ;;
+        *) IMAGE="$1"; shift ;;
+    esac
+done
+
+[ -n "$IMAGE" ] || ab_die "用法: ab-upgrade <combined 镜像[.gz]> [--no-overlay] [--yes]"
+[ -f "$IMAGE" ] || ab_die "镜像不存在: $IMAGE"
+command -v grub-editenv >/dev/null 2>&1 || ab_die "缺少 grub-editenv (请启用特性片段 17-grub-ab)"
+[ -f "$AB_ENV" ] || ab_die "缺少 $AB_ENV (本机不是 A/B 布局?)"
+
+BOOT_DEV=$(ab_boot_dev)
+[ -n "$BOOT_DEV" ] || ab_die "/boot 未挂载"
+DISK=$(ab_disk_dev)
+set -- $(ab_slot_devs)
+SLOT_A_DEV=$1; SLOT_B_DEV=$2
+[ -b "${SLOT_A_DEV:-/nonexistent}" ] || ab_die "找不到槽 A 分区"
+[ -b "${SLOT_B_DEV:-/nonexistent}" ] || ab_die "找不到槽 B 分区"
+
+CUR=$(ab_current_slot "$SLOT_A_DEV" "$SLOT_B_DEV") || ab_die "无法判定当前槽 (命令行无 root=PARTUUID?)"
+case "$CUR" in
+    A) TGT=B; NEXT=1; TGT_DEV=$SLOT_B_DEV; TGT_LETTER=b ;;
+    B) TGT=A; NEXT=0; TGT_DEV=$SLOT_A_DEV; TGT_LETTER=a ;;
+    *) ab_die "当前槽判定异常: $CUR" ;;
+esac
+
+ABOUT=$(cat /tmp/sysinfo/model 2>/dev/null || true)
+ab_info "A/B 升级"
+echo "    磁盘      : $DISK"
+echo "    当前槽    : $CUR ($(blkid -s PARTUUID -o value "$([ "$CUR" = A ] && echo "$SLOT_A_DEV" || echo "$SLOT_B_DEV")" 2>/dev/null))"
+echo "    目标槽    : $TGT ($TGT_DEV)"
+echo "    镜像      : $IMAGE ($(stat -c%s "$IMAGE" 2>/dev/null || echo '?') 字节)"
+echo "    overlay   : $([ "$MIGRATE" = 1 ] && echo '迁移' || echo '不迁移(新槽将使用默认配置)')"
+
+WORK=/tmp/ab-upgrade.$$
+mkdir -p "$WORK"
+trap 'umount "$WORK/mnt" 2>/dev/null || true; [ -n "${NEWLOOP:-}" ] && losetup -d "$NEWLOOP" 2>/dev/null; rm -rf "$WORK"' EXIT INT TERM
+
+# ---------------------------------------------------------------------------
+# 1. 准备镜像
+# ---------------------------------------------------------------------------
+IMG="$IMAGE"
+case "$IMAGE" in
+    *.gz) ab_info "解压镜像 (gz)...";  gzip -dc "$IMAGE" > "$WORK/img"; IMG="$WORK/img" ;;
+    *.xz) ab_info "解压镜像 (xz)...";  xz -dc   "$IMAGE" > "$WORK/img"; IMG="$WORK/img" ;;
+esac
+
+set -- $(ab_check_image "$IMG") || ab_die "不是有效的 combined 镜像 (无分区表或 p2 非 squashfs)"
+IMG_P1_START=$1; IMG_P1_SIZE=$2; IMG_P2_START=$3; IMG_P2_SIZE=$4
+ab_info "镜像分区: p1 start=${IMG_P1_START}s size=${IMG_P1_SIZE}s ; p2 start=${IMG_P2_START}s size=${IMG_P2_SIZE}s"
+
+# 目标槽必须装得下镜像 p2
+TGT_MIB=$(( $(cat "/sys/class/block/$(basename "$TGT_DEV")/size") / 2048 ))
+IMG_MIB=$(( IMG_P2_SIZE / 2048 ))
+echo "    目标槽容量: ${TGT_MIB} MiB ; 镜像 rootfs: ${IMG_MIB} MiB"
+[ "$IMG_MIB" -le "$TGT_MIB" ] || ab_die "镜像 rootfs 比目标槽大, 拒绝写入 (请先扩建槽分区)"
+
+if [ "$ASSUME" != 1 ]; then
+    printf "确认写入槽 %s ? [y/N] " "$TGT"
+    read -r ans
+    case "$ans" in y|Y|yes|YES) ;; *) ab_die "已取消" ;; esac
+fi
+
+# ---------------------------------------------------------------------------
+# 2. 内核 -> /boot/vmlinuz.<目标槽>
+# ---------------------------------------------------------------------------
+ab_info "写入内核 -> /boot/vmlinuz.$TGT_LETTER"
+mkdir -p "$WORK/mnt"
+mounted=0
+for t in vfat ext4 auto; do
+    mount -t "$t" -o loop,ro,offset=$((IMG_P1_START * 512)) "$IMG" "$WORK/mnt" 2>/dev/null && { mounted=1; break; }
+done
+[ "$mounted" = 1 ] || ab_die "挂载镜像 p1 失败"
+[ -f "$WORK/mnt/boot/vmlinuz" ] || ab_die "镜像 p1 内没有 /boot/vmlinuz"
+cp "$WORK/mnt/boot/vmlinuz" "/boot/vmlinuz.$TGT_LETTER.new"
+umount "$WORK/mnt"
+mv "/boot/vmlinuz.$TGT_LETTER.new" "/boot/vmlinuz.$TGT_LETTER"
+sync
+
+# ---------------------------------------------------------------------------
+# 3. rootfs -> 目标槽
+# ---------------------------------------------------------------------------
+ab_info "写入 rootfs -> $TGT_DEV"
+dd if="$IMG" of="$TGT_DEV" bs=512 skip="$IMG_P2_START" count="$IMG_P2_SIZE" conv=fsync 2>/dev/null \
+    || ab_die "写入 rootfs 失败"
+sync
+
+# ---------------------------------------------------------------------------
+# 4. overlay 迁移
+# ---------------------------------------------------------------------------
+if [ "$MIGRATE" = 1 ]; then
+    OVL=$(ab_overlay_dir)
+    if [ -z "$OVL" ]; then
+        ab_warn "找不到 /overlay, 跳过 overlay 迁移 (新槽将使用默认配置)"
+    else
+        OFF=$(ab_overlay_offset "$TGT_DEV") || ab_die "无法计算 overlay 偏移"
+        ab_info "迁移 overlay: $OVL -> $TGT_DEV+$OFF"
+        NEWLOOP=$(losetup -f)
+        losetup -o "$OFF" "$NEWLOOP" "$TGT_DEV" || ab_die "losetup 失败"
+        mkfs.f2fs -f "$NEWLOOP" >/dev/null 2>&1 || mkfs.f2fs "$NEWLOOP" >/dev/null 2>&1 \
+            || ab_die "在新槽创建 f2fs 失败"
+        mount -t f2fs "$NEWLOOP" "$WORK/mnt" || ab_die "挂载新槽 overlay 失败"
+        ( cd "$OVL" && tar -cf - . ) | tar -C "$WORK/mnt" -xf - || ab_die "复制 overlay 内容失败"
+        sync
+        umount "$WORK/mnt"
+        losetup -d "$NEWLOOP"
+        NEWLOOP=""
+        ab_info "overlay 迁移完成"
+    fi
+fi
+
+# ---------------------------------------------------------------------------
+# 5. 设置一次性引导 + 失败回滚状态
+# ---------------------------------------------------------------------------
+ab_info "设置 grubenv: next_entry=$NEXT boot_ok=0 bootcount=0"
+ab_env_set next_entry="$NEXT" boot_ok=0 bootcount=0
+grub-editenv "$AB_ENV" list 2>/dev/null | sed 's/^/    /'
+
+cat <<EOF
+
+升级已写入槽 $TGT。下一步:
+    reboot                            # 重启后 GRUB 引导槽 $TGT (一次性)
+    ab-status                         # 起来后查看状态与健康标记
+若新槽起不来: GRUB 会自动切回槽 $CUR (连续 2 次未被标记成功)。
+EOF

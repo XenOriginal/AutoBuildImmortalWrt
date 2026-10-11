@@ -145,6 +145,27 @@ done
 echo "  OK: 覆盖层已注入并通过完整性断言"
 
 # ---------------------------------------------------------------------------
+# 1.6 安装 A/B 工具到 rootfs 覆盖层
+#
+#   设备侧工具的唯一真源在仓库 x86-64-host/ab/ 下, 构建时安装进镜像,
+#   避免"仓库里一份、镜像里另一份"的漂移。
+#   注意 rc.d 符号链接必须显式创建: 仅把脚本放进 /etc/init.d 不会开机自启。
+# ---------------------------------------------------------------------------
+echo ">>> 安装 A/B 工具 (ab-upgrade / ab-status / ab-bootok)..."
+install -d "$SRC_DIR/files/usr/sbin" "$SRC_DIR/files/usr/lib" \
+           "$SRC_DIR/files/etc/init.d" "$SRC_DIR/files/etc/rc.d"
+install -m 0755 "$SCRIPT_DIR/ab/ab-upgrade" "$SRC_DIR/files/usr/sbin/ab-upgrade"
+install -m 0755 "$SCRIPT_DIR/ab/ab-status"  "$SRC_DIR/files/usr/sbin/ab-status"
+install -m 0644 "$SCRIPT_DIR/ab/ab-lib.sh"  "$SRC_DIR/files/usr/lib/ab-lib.sh"
+install -m 0755 "$SCRIPT_DIR/ab/ab-bootok"  "$SRC_DIR/files/etc/init.d/ab-bootok"
+ln -sf ../init.d/ab-bootok "$SRC_DIR/files/etc/rc.d/S95ab-bootok"
+for f in usr/sbin/ab-upgrade usr/sbin/ab-status usr/lib/ab-lib.sh \
+         etc/init.d/ab-bootok etc/rc.d/S95ab-bootok; do
+    [ -e "$SRC_DIR/files/$f" ] || { echo "!!! A/B 工具安装失败: $f"; exit 1; }
+done
+echo "  OK: A/B 工具已就位 (含 /etc/rc.d/S95ab-bootok 自启链接)"
+
+# ---------------------------------------------------------------------------
 # 2. 注入自定义 QAT 包
 # ---------------------------------------------------------------------------
 echo ">>> 注入 QAT 驱动包与固件包..."

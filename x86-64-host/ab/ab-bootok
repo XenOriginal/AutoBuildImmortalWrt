@@ -1,0 +1,68 @@
+#!/bin/sh /etc/rc.common
+# ============================================================================
+# A/B 启动成功标记 (boot-ok)
+#
+# 【作用】A/B 的失败回滚判定在【引导器侧】: GRUB 每次启动若发现 boot_ok != 1
+# 就把 bootcount 递增, 连续两次后自动切回另一个槽。本服务负责在系统"确实
+# 健康地起来了"之后写 boot_ok=1, 让 GRUB 知道这次启动是成功的。
+#
+# 【为什么必须由系统侧写】内核 panic / 早期挂死时系统内没有任何代码能执行,
+# 只有 GRUB 能救 —— 这正是不能在固件里"自己判断是否回滚"的原因。
+#
+# 【健康判据】
+#   1) 有默认路由 (网络真的起来了) —— 对路由器/容器宿主这是最低要求
+#   2) 可选: /etc/ab-health.sh 存在且以 0 退出 (自定义检查, 如 NFS 可达)
+#   若在超时内不满足, 就【不标记】, 由 GRUB 在下次启动完成回滚。
+#
+# 【与看门狗的关系】喂狗服务必须在本服务之后启动 (START 更大), 否则新槽
+# "起不来"会被 watchdog 反复重启, 掩盖回滚判定。
+#
+# 日志: /etc/ab.log
+# ============================================================================
+
+START=95
+STOP=10
+USE_PROCD=0
+
+AB_ENV=/boot/grub/grubenv
+AB_LOG=/etc/ab.log
+AB_WAIT=${AB_WAIT:-180}      # 最长等待秒数
+AB_PING=${AB_PING:-1.1.1.1}  # 备用可达性探测 (可选, 失败不致命)
+
+log() { echo "$(date '+%Y-%m-%d %H:%M:%S') ab-bootok: $*" >> "$AB_LOG"; }
+
+start() {
+    [ -f "$AB_ENV" ] || { log "无 $AB_ENV, 非 A/B 布局, 跳过"; return 0; }
+    command -v grub-editenv >/dev/null 2>&1 || { log "缺 grub-editenv, 跳过"; return 0; }
+
+    if [ "$(grub-editenv "$AB_ENV" list 2>/dev/null | sed -n 's/^boot_ok=//p' | head -1)" = "1" ]; then
+        log "boot_ok 已为 1, 无需改动"
+        return 0
+    fi
+
+    log "等待健康检查 (最多 ${AB_WAIT}s)..."
+
+    n=0
+    while [ "$n" -lt "$AB_WAIT" ]; do
+        ok=1
+        # 1) 默认路由
+        ip route show default 2>/dev/null | grep -q . || ok=0
+        # 2) 自定义检查
+        if [ "$ok" = 1 ] && [ -x /etc/ab-health.sh ]; then
+            /etc/ab-health.sh >/dev/null 2>&1 || ok=0
+        fi
+        if [ "$ok" = 1 ]; then
+            grub-editenv "$AB_ENV" set boot_ok=1 bootcount=0
+            log "健康检查通过 (${n}s): boot_ok=1 bootcount=0 已写入"
+            return 0
+        fi
+        n=$((n + 3))
+        sleep 3
+    done
+
+    log "!!! 健康检查超时 (${AB_WAIT}s) —— 不标记成功, 下次启动将由 GRUB 回滚"
+    return 1
+}
+
+boot()  { start; }
+reload() { start; }
