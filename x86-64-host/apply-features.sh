@@ -93,11 +93,13 @@ section_lines() {
 # ---------------------------------------------------------------------------
 cfg_set() {
     sed -i "/^$2=/d" "$1"
+    sed -i "/^#[[:space:]]*$2=/d" "$1"           # 防御: 注释形式的历史赋值(如 # CONFIG_X="iso8859-1")
     sed -i "/^#[[:space:]]*$2 is not set$/d" "$1"
     printf '%s=%s\n' "$2" "$3" >> "$1"
 }
 cfg_unset() {
     sed -i "/^$2=/d" "$1"
+    sed -i "/^#[[:space:]]*$2=/d" "$1"
     sed -i "/^#[[:space:]]*$2 is not set$/d" "$1"
     printf '# %s is not set\n' "$2" >> "$1"
 }

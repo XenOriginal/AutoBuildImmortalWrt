@@ -49,6 +49,21 @@ if command -v smartctl >/dev/null 2>&1; then
     done
 fi
 
+# ---- SSD 磨损 / 写入量 (迁移到 SSD 后需要盯) ----
+if command -v smartctl >/dev/null 2>&1; then
+    for d in /dev/sda /dev/nvme0; do
+        [ -b "$d" ] || continue
+        a=$(smartctl -A "$d" 2>/dev/null)
+        wear=$(echo "$a" | awk '/Percentage_Used|Media_Wearout_Indicator/{print $10; exit}')
+        if [ -n "${wear:-}" ]; then
+            say "SSD 磨损 $d: ${wear}%"
+            [ "$wear" -ge 80 ] && warn "SSD 磨损告警: $d 已用 ${wear}%"
+        fi
+        lba=$(echo "$a" | awk '/Total_LBAs_Written/{print $10; exit}')
+        [ -n "${lba:-}" ] && say "SSD 累计写入 $d: ${lba} LBA (x512B)"
+    done
+fi
+
 # ---- overlay 使用率 ----
 if [ -d /overlay ]; then
     u=$(df -h /overlay 2>/dev/null | awk 'NR==2{print $5}' | tr -d '%')

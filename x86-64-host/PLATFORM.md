@@ -83,6 +83,38 @@
 
 ---
 
+## 五之二、可移动存储与文件系统（半专属，但中文环境必做）
+
+| # | 项 | 为什么该做 | 实测证据 | 实现位置 |
+| --- | --- | --- | --- | --- |
+| 5b.1 | **FAT 默认字符集改 utf8** | 基线 `CONFIG_FAT_DEFAULT_IOCHARSET="iso8859-1"`，中文文件名会乱码；内核其实已带 `nls_utf8.ko`，只是默认值不对 | 实测同一 FAT 镜像：默认挂载显示 `????.txt`，`iocharset=utf8` 挂载显示 `中文测试.txt`；exFAT（内部 UTF-8）与 ntfs3（默认 UTF-8）无此问题 | 特性片段 `25-storage-fs` 设 `FAT_DEFAULT_IOCHARSET="utf8"` + `NLS_DEFAULT="utf8"` |
+| 5b.2 | **exFAT 工具链** | 内核 `exfat.ko` 已在，但格式化/修复需求要靠用户态工具 | feed 有 `exfat-mkfs`/`exfat-fsck`；实测 `mkfs.exfat` 可写中文名 | `25-storage-fs` |
+| 5b.3 | **NTFS 工具链** | 内核 `ntfs3.ko` 已可读写，但缺 `mkntfs`/`ntfsfix`/FUSE 兜底 | 现固件 `mkntfs`/`ntfsfix`/`ntfs-3g` 均缺失 | `25-storage-fs` 加 `ntfs-3g` + `ntfs-3g-utils` |
+| 5b.4 | **周期 TRIM（fstrim）** | SSD 支持 TRIM，但现固件 f2fs overlay 是 **nodiscard** 挂载、且根本没有 `fstrim`；迁移到 SSD 后不做 TRIM 会让 GC/擦除效率随使用下降 | `hdparm -I /dev/sda` 显示 TRIM supported；`grep overlay /proc/mounts` 含 `nodiscard`；`command -v fstrim` 为空 | `25-storage-fs` 加 `fstrim` 包；`hw-healthd` 每 24h 对 SSD 挂载点执行 |
+
+## 五之三、迁移到「大内存 + 高速 SSD」后需要改的旧策略（专属）
+
+旧策略是为 **7.6 GB 内存 + 慢速 U 盘** 调的，而且是"保命"而非"性能"——
+实测小文件回写仅 ~0.44 MB/s，默认回写策略会把脏页堆成堰塞湖，触发整机 D 状态挂死。
+
+| 参数 | 旧值（U 盘时代） | 新值（SSD + 31GB） | 理由 |
+| --- | --- | --- | --- |
+| `vm.dirty_background_bytes` / `vm.dirty_bytes` | 32 MB / 64 MB | 归零 → 改用比例 **5% / 15%** | 64 MB 上限会严重压制 SSD 写吞吐（SSD 随机写快两个数量级） |
+| `vm.dirty_expire_centisecs` / `dirty_writeback_centisecs` | 500 / 200（5s / 2s） | **3000 / 500**（内核默认节奏） | 2 秒一次强制回写唤醒在 SSD 上纯属浪费 |
+| `vm.swappiness` | 150（为 zram 设定） | **10** | 31 GB 内存下应尽量不换出 |
+| zram（内存 50%） | 15.6 GB zram 常驻 | **跳过** | 内存充裕时 zram 只烧 CPU |
+| `vm.max_map_count` | 65530（默认） | **262144** | 容器/JVM/数据库类负载常见需求 |
+| IO 挂死检测 | 无（只有硬件看门狗直接重启） | **`hung_task_timeout_secs=120`** + warnings | 先记录"是谁卡住"，再由看门狗兜底；**不设 `hung_task_panic`**，避免瞬时抖动触发重启 |
+| SSD TRIM | 无 | 每 24h `fstrim` | 见 5b.4 |
+
+**实现方式：按存储层级自适应**（`x86-64-host/hw/hw-mem`，S94）
+
+- 探测 `/rom`、`/Lager` 所在设备的层级（`/sys/block/*` 总线是 `usb` 还是 `ata/nvme`）
+- **USB** → 保持旧保守策略（`/etc/sysctl.conf` 原值不动）
+- **内置盘** → 切换到上表新策略，并写入 `/etc/hw-mem.log`
+- 为什么必须自适应：**同一份固件在"从 U 盘启动"和"从 SSD 启动"两种形态下都要正确**
+  ——迁移过渡期两种状态都会真实出现。
+
 ## 六、可靠性与运维
 
 | # | 项 | 为什么专属 | 实测证据 | 实现位置 |
@@ -144,6 +176,16 @@ sysctl net.ipv4.tcp_congestion_control net.core.default_qdisc \
 for i in eth0 eth1 eth2; do echo "$i: $(ethtool -k $i | awk '/rx-udp-gro-forwarding/{print $2}')"; done
 nft list ruleset | grep -A3 flowtable
 
+# 5b) 存储与文件系统
+zcat /proc/config.gz 2>/dev/null | grep -E 'FAT_DEFAULT_IOCHARSET|NLS_DEFAULT'
+for c in mkfs.exfat fsck.exfat mkntfs ntfsfix fstrim; do echo "$c: $(command -v $c || echo -)"; done
+printf '中文测试\n' > /tmp/中文测试.txt; ls /tmp | grep 中文   # 终端/文件系统编码链路
+
+# 5c) 迁移后的内存/IO 策略
+sysctl vm.dirty_background_ratio vm.dirty_ratio vm.swappiness vm.max_map_count \
+       kernel.hung_task_timeout_secs
+cat /etc/hw-mem.log        # 应显示层级探测结果与所采用策略
+
 # 6) 可靠性与 A/B
 ls -l /dev/watchdog; logread | grep -E 'hw-watchdog|hw-tune|hw-health'
 hw-health; ab-status
@@ -155,8 +197,8 @@ hw-health; ab-status
 
 | | 条目 |
 | --- | --- |
-| **平台专属**（换机器即不成立） | 1.1–1.5、2.1、2.2、2.3、2.7、3.1–3.4、4.1–4.5、5.1–5.5、6.1、6.2 |
-| **半专属**（通用实践，因本机用途/拓扑成为必做） | 2.6、3.5、4.6、5.6、6.3、6.4 |
+| **平台专属**（换机器即不成立） | 1.1–1.5、2.1、2.2、2.3、2.7、3.1–3.4、4.1–4.5、5.1–5.5、5之三、6.1、6.2 |
+| **半专属**（通用实践，因本机用途/拓扑成为必做） | 2.6、3.5、4.6、5.6、5b.1–5b.4、6.3、6.4 |
 | **通用基线** | 第七节（特性片段机制、efibootmgr/efivarfs、grub2-editenv、crypto kmod、镜像精简可选、依赖收敛） |
 | **刻意不做** | 第八节（VAB、NIC 硬件 TC 卸载、`-march`、共享 overlay、`mitigations=off`、`fq`/ECN 默认切换） |
 | **待外部条件** | QAT 与 VT-d 直通（BIOS 开关）、A/B 实机切换（维护窗口）、CI 产物（构建中） |

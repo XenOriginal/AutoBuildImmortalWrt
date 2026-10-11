@@ -20,8 +20,25 @@ start() {
     (
         # 首次稍作延迟, 等系统与服务就绪
         sleep 60
+        tick=0
         while :; do
             /usr/sbin/hw-health -q >/dev/null 2>&1 || true
+
+            # 每 24 小时(默认 15min x 96)对 SSD 上的挂载点做一次 TRIM。
+            # 为什么需要: 现固件 f2fs overlay 是 nodiscard 挂载, 不主动 TRIM
+            # 会让 SSD 的 GC/擦除效率随使用下降(迁移到 SSD 后才成为问题)。
+            tick=$((tick + 1))
+            if [ $((tick % 96)) -eq 1 ] && command -v fstrim >/dev/null 2>&1; then
+                for m in /overlay /Lager; do
+                    dev=$(awk -v mm="$m" '$2==mm{print $1; exit}' /proc/mounts)
+                    case "$dev" in
+                        /dev/*) bus=$(readlink -f "/sys/block/$(basename "$(echo "$dev" | sed -e "s/[0-9]*$//")")" 2>/dev/null)
+                                case "$bus" in *ata*|*nvme*)
+                                    fstrim -v "$m" >/dev/null 2>&1 && logger -t hw-healthd "fstrim $m 完成" ;;
+                                esac ;;
+                    esac
+                done
+            fi
             sleep "$INTERVAL"
         done
     ) &

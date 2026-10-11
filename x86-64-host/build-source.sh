@@ -188,9 +188,11 @@ done
 echo "  OK: 硬件适配工具已就位 (S96hw-watchdog / S97hw-healthd)"
 
 install -m 0755 "$SCRIPT_DIR/hw/hw-tune" "$SRC_DIR/files/etc/init.d/hw-tune"
+install -m 0755 "$SCRIPT_DIR/hw/hw-mem"  "$SRC_DIR/files/etc/init.d/hw-mem"
 ln -sf ../init.d/hw-tune "$SRC_DIR/files/etc/rc.d/S98hw-tune"
-[ -e "$SRC_DIR/files/etc/init.d/hw-tune" ] || { echo "!!! hw-tune 安装失败"; exit 1; }
-echo "  OK: 运行期调优脚本已就位 (S98hw-tune)"
+ln -sf ../init.d/hw-mem  "$SRC_DIR/files/etc/rc.d/S94hw-mem"
+[ -e "$SRC_DIR/files/etc/init.d/hw-mem" ] || { echo "!!! hw-mem 安装失败"; exit 1; }
+echo "  OK: 运行期调优脚本已就位 (S94hw-mem / S98hw-tune)"
 
 # ---------------------------------------------------------------------------
 # 2. 注入自定义 QAT 包

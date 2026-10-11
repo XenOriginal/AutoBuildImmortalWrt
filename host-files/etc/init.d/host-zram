@@ -11,7 +11,42 @@
 # ============================================================================
 START=15
 
+# 去掉分区号 -> 整盘设备名
+_zram_strip() {
+    local d=$1 b
+    case "$d" in
+        *p[0-9]|*p[0-9][0-9])
+            pre=${d%p*}; case "$pre" in *[0-9]|*n) echo "$pre" ;; *) echo "$d" ;; esac ;;
+        /dev/sd[a-z][0-9]*|/dev/hd[a-z][0-9]*|/dev/vd[a-z][0-9]*)
+            b=$d; while :; do case "$b" in *[0-9]) b=${b%[0-9]} ;; *) break ;; esac; done; echo "$b" ;;
+        *) echo "$d" ;;
+    esac
+}
+
 start() {
+    # ------------------------------------------------------------------
+    # 【按硬件自适应】旧策略(zram = 内存 50% + swappiness=150)是为
+    #   7.6GB 内存 + 慢速 U 盘 准备的。迁移到 31GB 内存 + SSD 后,
+    #   zram 既无必要(内存充裕)又浪费 CPU(压缩/解压)。
+    #   规则: 内存 >= 8GB 且 根/数据分区在内置盘 -> 不建 zram。
+    # ------------------------------------------------------------------
+    mem_mb=$(( $(awk '/MemTotal/{print $2}' /proc/meminfo) / 1024 ))
+    tier=unknown
+    for m in /rom /Lager; do
+        dev=$(awk -v mm="$m" '$2==mm{print $1; exit}' /proc/mounts)
+        case "$dev" in
+            /dev/*) bus=$(readlink -f "/sys/block/$(basename "$(_zram_strip "$dev")")" 2>/dev/null)
+                    case "$bus" in
+                        *usb*) tier=usb ;;
+                        *ata*|*nvme*|*virtio*) [ "$tier" = unknown ] && tier=internal ;;
+                    esac ;;
+        esac
+    done
+    if [ "$mem_mb" -ge 8192 ] && [ "$tier" = internal ]; then
+        logger -t host-zram "内存 ${mem_mb}MB + 内置盘: 跳过 zram (无需压缩交换)"
+        return 0
+    fi
+
     # 若 zram 已由 zram-swap 包初始化, 不再重复处理
     if [ -e /dev/zram0 ] && grep -q zram /proc/swaps; then
         logger -t host-zram "zram swap already active, skipping"

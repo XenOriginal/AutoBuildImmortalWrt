@@ -1,0 +1,105 @@
+#!/bin/sh /etc/rc.common
+# ============================================================================
+# 内存 / IO 策略 —— 按【存储层级】自适应
+#
+# 【为什么需要自适应, 而不是固定值】
+#   旧策略是为旧硬件调的, 而且调得很极端:
+#     vm.dirty_background_bytes = 32MB / vm.dirty_bytes = 64MB
+#     vm.dirty_expire_centisecs = 500 (5s) / vm.dirty_writeback_centisecs = 200 (2s)
+#     vm.swappiness = 150
+#   原因是系统跑在**慢速 U 盘**上(实测小文件回写仅 ~0.44MB/s), 默认回写策略会
+#   把脏页堆成堰塞湖, 触发整机 D 状态挂死 —— 这些值是"保命"而不是"性能"。
+#
+#   但迁移到 **477G SSD + 31GB 内存** 后:
+#     - 64MB 的脏页上限会严重压制写入吞吐(SSD 随机写比 U 盘快两个数量级);
+#     - 150 的 swappiness 是给 zram 用的, 大内存下应当少换出;
+#     - 2 秒一次的强制回写唤醒在 SSD 上纯属浪费。
+#   所以本脚本在启动时判断"根/数据分区在 USB 还是内置盘", 分别套用两套策略:
+#
+#     USB  (迁移前 / 临时从 U 盘启动) -> 保留原有保守策略(不改动)
+#     内置 SSD                       -> 放宽回写、降低 swappiness、打开 IO 挂死检测
+#
+# 【IO 看门狗】
+#   旧机器的问题本质是"IO 卡死", 而当时只有硬件看门狗(直接重启)。现在:
+#     - 保留 hw-watchdog (硬件兜底)
+#     - 增加内核 hung_task 检测: 超过阈值仍处 D 状态的任务会被记录(warnings),
+#       让我们能在重启前从日志看到"是谁卡住了", 而不是只看到一次重启。
+#   注意: 不设 hung_task_panic —— 生产环境宁可先记录再靠看门狗兜底, 避免
+#   瞬时 IO 抖动直接触发重启。
+#
+# 【为什么策略不写死在 /etc/sysctl.conf】
+#   同一份固件在"从 U 盘启动"和"从 SSD 启动"两种形态下都必须正确
+#   (迁移过渡期两种状态都会出现), 所以 sysctl.conf 保留 USB 保守基线,
+#   由本脚本在 SSD 形态下覆盖。
+# ============================================================================
+
+START=94
+LOG=/etc/hw-mem.log
+
+log() { logger -t hw-mem "$1"; echo "$(date '+%F %T') $1" >> "$LOG"; }
+
+# 去掉分区号 -> 整盘设备名 (注意 loop3 这类名字不能被误裁)
+strip_part() {
+    local d=$1 b
+    case "$d" in
+        *p[0-9]|*p[0-9][0-9]|*p[0-9][0-9][0-9])
+            pre=${d%p*}
+            case "$pre" in *[0-9]|*n) echo "$pre" ;; *) echo "$d" ;; esac ;;
+        /dev/sd[a-z][0-9]*|/dev/hd[a-z][0-9]*|/dev/vd[a-z][0-9]*)
+            b=$d; while :; do case "$b" in *[0-9]) b=${b%[0-9]} ;; *) break ;; esac; done; echo "$b" ;;
+        *) echo "$d" ;;
+    esac
+}
+
+# 挂载点所在设备的存储层级: usb | internal | unknown
+tier_of_mount() { # $1=挂载点
+    local dev disk bus
+    dev=$(awk -v m="$1" '$2==m{print $1; exit}' /proc/mounts)
+    case "$dev" in /dev/*) ;; *) echo unknown; return ;; esac
+    disk=$(strip_part "$dev")
+    bus=$(readlink -f "/sys/block/$(basename "$disk")" 2>/dev/null)
+    case "$bus" in
+        *usb*)  echo usb ;;
+        *ata*|*nvme*|*virtio*|*mmc*) echo internal ;;
+        *) echo unknown ;;
+    esac
+}
+
+apply_usb_policy() {
+    log "存储层级=USB -> 保留保守策略(不动 sysctl; 由 /etc/sysctl.conf 提供)"
+}
+
+apply_internal_policy() {
+    log "存储层级=内置盘 -> 应用 SSD/大内存策略"
+    # 回写: 交回内核的比例控制 (5% / 15%), 清掉 *_bytes 覆盖
+    sysctl -qw vm.dirty_background_bytes=0 vm.dirty_bytes=0
+    sysctl -qw vm.dirty_background_ratio=5 vm.dirty_ratio=15
+    # 回写频率回到内核默认节奏 (30s 过期 / 5s 唤醒)
+    sysctl -qw vm.dirty_expire_centisecs=3000 vm.dirty_writeback_centisecs=500
+    # 大内存 + SSD: 不急着换出
+    sysctl -qw vm.swappiness=10
+    # 容器/JVM/数据库类负载常需要更大的 mmap 计数
+    sysctl -qw vm.max_map_count=262144
+    # IO 挂死检测(记录而非 panic): 120s 仍未完成的任务写进内核日志
+    sysctl -qw kernel.hung_task_timeout_secs=120
+    sysctl -qw kernel.hung_task_warnings=10
+    log "  dirty_background_ratio=5 dirty_ratio=15 swappiness=10 max_map_count=262144 hung_task_timeout=120s"
+}
+
+start() {
+    r=$(tier_of_mount /rom)
+    [ "$r" = unknown ] && r=$(tier_of_mount /)
+    l=$(tier_of_mount /Lager)
+    log "层级探测: /rom=$r /Lager=$l"
+
+    # fail-safe: 判不准时保留保守策略。
+    # (/Lager 在挂载延迟时可能读不到, 若默认走 SSD 分支就会在 U 盘形态下
+    #  误放宽回写上限 —— 那正是历史上导致 D 状态挂死的配置。)
+    case "$r|$l" in
+        *usb*)      apply_usb_policy ;;
+        *internal*) apply_internal_policy ;;
+        *)          log "存储层级无法判定 -> 保守起见保留现有策略"; apply_usb_policy ;;
+    esac
+}
+
+stop() { :; }
