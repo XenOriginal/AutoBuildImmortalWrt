@@ -1,11 +1,11 @@
 # ============================================================================
 # A/B 双槽引导菜单模板 —— 由 ab-layout.sh 安装到 /boot/grub/grub.cfg
 #
-# 占位符 (安装时替换):
-#   @@PARTUUID_A@@  槽 A rootfs 分区的 PARTUUID
-#   @@PARTUUID_B@@  槽 B rootfs 分区的 PARTUUID
-#   @@BOOTOPTS@@    内核命令行 (console=... intel_iommu=on iommu=pt)
-#   @@TIMEOUT@@     菜单超时秒数
+# 安装时替换的占位符 (脚本用 sed 填入真实值):
+#   PARTUUID_A / PARTUUID_B  两个槽 rootfs 分区的 PARTUUID
+#   BOOTOPTS                 内核命令行 (console=... intel_iommu=on iommu=pt)
+#   TIMEOUT                  菜单超时秒数
+#   BAUD                     串口波特率 (本机 BIOS console redirection 实测 57600)
 #
 # grubenv 变量 (GRUB 侧 load_env/save_env 读写, 系统侧 grub-editenv 读写):
 #   next_entry : 一次性引导目标槽 (0=A, 1=B, 空=按 default)
@@ -16,20 +16,41 @@
 #   新槽第一次引导时 boot_ok=0 → 计数递增; 若系统起不来 (内核 panic/挂死),
 #   计数到 2 后自动把 default 切回另一槽 —— 无需任何人工介入。
 #   系统起来后由 /etc/init.d/ab-bootok 做健康检查并写 boot_ok=1, 计数清零。
+#
+# 【两个实测坑, 别踩】
+#   1) 串口初始化必须在最前面: 否则此前的输出只去 VGA, 无头机器上等于黑屏。
+#   2) grubenv 必须走【显式路径】: 官方 core.img 的 early config 只做了
+#      configfile (hd0,gpt1)/boot/grub/grub.cfg, 并没有设置 $root/$prefix,
+#      直接 load_env 会因为拿不到设备路径而失败 (实测报 unknown filesystem)。
+#      这里用 search --label kernel 定位 /boot 分区后再指定 env 文件。
+#   3) 官方模块表里没有 echo: 调试打印会报 "can't find command `echo'"
+#      (已通过构建补丁把 echo 一并编入, 便于无头排障)。
 # ============================================================================
 
+# ---- 串口 (无头运维; 必须最先执行) ----
+serial --unit=0 --speed=@@BAUD@@ --word=8 --parity=no --stop=1 --rtscts=off
+terminal_input console serial
+terminal_output console serial
+
+# ---- 定位 /boot 分区与 grubenv ----
 set timeout=@@TIMEOUT@@
 set default=0
 
-if [ -s $prefix/grubenv ]; then
-  load_env
+search --label kernel --set=abroot
+if [ -z "$abroot" ]; then
+  set abroot=(hd0,gpt1)
 fi
+set abenv=($abroot)/boot/grub/grubenv
 
 # ---- 一次性引导 (升级后指向新槽, 只生效一次) ----
+if [ -s $abenv ]; then
+  load_env -f $abenv
+fi
+
 if [ -n "${next_entry}" ]; then
   set default="${next_entry}"
   set next_entry=
-  save_env next_entry
+  save_env -f $abenv next_entry
 fi
 
 # ---- 失败回退: 连续未标记成功则切回另一槽 ----
@@ -50,7 +71,7 @@ else
       set bootcount=1
     fi
   fi
-  save_env default bootcount boot_ok
+  save_env -f $abenv default bootcount boot_ok
 fi
 
 menuentry "ImmortalWrt (slot A)" --id slot-a {

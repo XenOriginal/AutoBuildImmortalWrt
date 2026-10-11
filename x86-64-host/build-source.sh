@@ -86,11 +86,11 @@ for p in "$SCRIPT_DIR"/ab/patches/*.patch; do
     patch -p1 < "$p" >/dev/null
 done
 shopt -u nullglob
-if ! grep -q 'part_gpt reboot search serial test vga loadenv' package/boot/grub2/Makefile; then
+if ! grep -q 'serial test vga echo loadenv' package/boot/grub2/Makefile; then
     echo "!!! grub2 模块补丁未生效 —— A/B 自动回滚会失效, 终止"
     exit 1
 fi
-echo "    OK: core.img / bootx64.efi 将内嵌 loadenv (load_env + save_env)"
+echo "    OK: core.img / bootx64.efi 将内嵌 echo + loadenv (load_env + save_env)"
 
 # ---------------------------------------------------------------------------
 # 1.5 注入宿主机自定义 rootfs 覆盖层 (files/)
