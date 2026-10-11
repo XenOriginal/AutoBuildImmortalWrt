@@ -5,7 +5,9 @@
 ```
 features/
 ├── enabled.txt          # 默认启用清单 (一行一个片段名)
+├── 12-uefi-boot.conf    # UEFI/Legacy 双启动兼容 (efibootmgr + efivarfs)
 ├── 10-kvm-host.conf     # KVM/QEMU 硬件虚拟机宿主能力
+├── 15-iommu-vtd.conf    # VT-d/IOMMU 直通能力预留 (Intel IOMMU + VFIO)
 ├── 20-crypto-accel.conf # 加密/校验内核模块
 ├── 30-microcode.conf    # Intel CPU 微码
 ├── 40-net-tune.conf     # [可选] 内核时钟 100→250Hz

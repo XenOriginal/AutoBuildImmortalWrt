@@ -191,8 +191,17 @@ echo 'CONFIG_GRUB_BAUDRATE=57600' >> .config
 # 多声明一个候选 console= 是官方支持的注入口, 且内核对该端口不存在时会静默忽略;
 # 万一实测编号与 5.6 节推导不符, 仍能在物理口上看到内核启动日志。
 # 登录口不依赖它 —— 由固件内 hsuart-console-detect 服务按 /sys 动态补齐。
+# 【VT-d / IOMMU 预留 (2026-10-11)】
+#   本机 BIOS 的 ACPI DMAR 表已存在 (VT-d 硬件在), 内核也内建了
+#   CONFIG_INTEL_IOMMU / IRQ_REMAP, 但官方基线没开 INTEL_IOMMU_DEFAULT_ON,
+#   也没有任何 intel_iommu= 参数 —— 实测结果是 IOMMU 根本不激活:
+#       /sys/kernel/iommu_groups = 0, /sys/class/iommu 为空。
+#   这里显式打开, 并把未绑定设备的地址翻译设为 passthrough (iommu=pt),
+#   避免全机 DMA 翻译的性能损失 (本机是容器宿主 + 路由, 必须用 pt)。
+#   BIOS 未开 VT-d 时该参数无副作用 (没有 DMAR 表就不会激活)。
+#   配套的软件侧 (VFIO 模块) 由特性片段 15-iommu-vtd 负责。
 sed -i "/^CONFIG_GRUB_BOOTOPTS=/d" .config
-echo 'CONFIG_GRUB_BOOTOPTS="console=ttyS4,57600n8 console=ttyS5,57600n8"' >> .config
+echo 'CONFIG_GRUB_BOOTOPTS="console=ttyS4,57600n8 console=ttyS5,57600n8 intel_iommu=on iommu=pt"' >> .config
 
 # ---- 宿主机必备软件包 ----
 HOST_PKGS="

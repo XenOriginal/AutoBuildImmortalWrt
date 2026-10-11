@@ -3,11 +3,18 @@
 # 未登记在这里的片段 = 可选优化, 默认不编入固件。
 # 需要时用环境变量临时开启 (可逗号分隔多个):
 #     FEATURES=40-net-tune,50-image-slim bash x86-64-host/build-source.sh
+# CI 亦可在 workflow_dispatch 时填 features 输入达到同样效果。
 #
 # 新增/删除一项优化: 只改本文件, 构建脚本主体不动。
 
-# KVM/QEMU 硬件虚拟化宿主能力 (/dev/kvm + vhost-net + VFIO + QEMU)
+# UEFI/Legacy 双启动兼容 (efibootmgr + efivarfs; 后续优先 UEFI 启动)
+12-uefi-boot
+
+# KVM/QEMU 硬件虚拟化宿主能力 (/dev/kvm + vhost-net + QEMU)
 10-kvm-host
+
+# VT-d/IOMMU 直通能力预留 (Intel IOMMU 默认开 + VFIO; BIOS 打开 VT-d 即可用)
+15-iommu-vtd
 
 # 加密/校验内核模块 (SHA-1/SHA-256/GHASH/CRC32C; AES-NI 官方基线已内建)
 20-crypto-accel

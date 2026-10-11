@@ -21,7 +21,10 @@
 | 软件 flowtable | 已开启且生效：`flowtable ft { devices={docker0,eth0,eth1,eth2,pppoe-wan} flags offload }`，实测 28 条 conntrack 处于 `OFFLOAD` |
 | 硬件卸载 | `ethtool -k eth0/eth1` → `hw-tc-offload: off [fixed]`（内核未编 TC 卸载基础设施） |
 | KVM | 官方固件里**无任何 KVM 模块**、`/dev/kvm` 不存在（CPU 支持，纯软件缺失） |
-| QAT | `lspci` 全表 21 个设备，**无任何 `[0b40] Processing accelerators`**，无 QAT 固件/驱动/包 |
+| VT-d / IOMMU | `DMAR` 表存在（硬件在）；内核 `INTEL_IOMMU=y` / `IRQ_REMAP=y` 已内建，但 **`INTEL_IOMMU_DEFAULT_ON` 未开**、命令行无 `intel_iommu=` → 实测 `/sys/kernel/iommu_groups = 0`、`/sys/class/iommu` 为空，**IOMMU 未激活** |
+| VFIO | 官方基线 **`CONFIG_VFIO` 未编**，固件内无 `vfio` / `vfio-pci` 模块 → 即便 IOMMU 打开也无法把设备交给虚拟机 |
+| 启动方式 | 当前 **Legacy BIOS** 启动（无 `/sys/firmware/efi`）；target 本身同时产出 BIOS 与 EFI 两份合盘镜像 |
+| QAT | BIOS 中未启用（用户确认），故 `lspci` 全表 21 个设备无 `[0b40]` 加速器；BIOS 打开后设备即出现，固件侧驱动已随构建集成（内存为后续加装，现 31.2 GB） |
 | 官方内核基线 | `NET_CLS_ACT/FLOWER/ACT_CT/SCH_INGRESS/PSAMPLE` 全部 `not set`；`HZ=100`；`GENERIC_CPU=y`；`CRYPTO_AES_NI_INTEL=y` |
 
 ---
@@ -30,7 +33,9 @@
 
 | 片段 | 内容 | 依据 | 刷机后核验 |
 | --- | --- | --- | --- |
-| `10-kvm-host` | `kmod-kvm-x86/-intel`、`vhost-net`、`vfio(-pci)`、`qemu-x86_64-softmmu`、`qemu-img`、SeaBIOS/EFI 固件、`qemu-bridge-helper` | 手工装包后 `/dev/kvm` 出现、`qemu -accel kvm -cpu host` 实跑通 SeaBIOS 引导（`-cpu host` 仅 KVM 可用，排除 TCG） | `ls -l /dev/kvm`；`lsmod \| grep -E 'kvm\|vhost'` |
+| `12-uefi-boot` | `efibootmgr`、`kmod-fs-efivarfs` | 官方基线 `CONFIG_EFIVAR_FS=m`（故按包选，不能强写 `=y`）；`efibootmgr` 是"优先 UEFI 启动"的操作工具 | `ls /sys/firmware/efi`；`efibootmgr -v` |
+| `10-kvm-host` | `kmod-kvm-x86/-intel`、`vhost-net`、`qemu-x86_64-softmmu`、`qemu-img`、SeaBIOS/EFI 固件、`qemu-bridge-helper` | 手工装包后 `/dev/kvm` 出现、`qemu -accel kvm -cpu host` 实跑通 SeaBIOS 引导（`-cpu host` 仅 KVM 可用，排除 TCG） | `ls -l /dev/kvm`；`lsmod \| grep -E 'kvm\|vhost'` |
+| `15-iommu-vtd` | `kmod-vfio`、`kmod-vfio-pci` + 内核 `INTEL_IOMMU=y`、`INTEL_IOMMU_DEFAULT_ON=y`、`IRQ_REMAP=y` | 见上文"VFIO/VT-d"两行实测；配套命令行 `intel_iommu=on iommu=pt` 写在 `build-source.sh` §4.2 | BIOS 开 VT-d 后：`ls /sys/kernel/iommu_groups/`、`ls /sys/class/iommu/`、`ls /sys/bus/pci/drivers/vfio-pci` |
 | `20-crypto-accel` | `kmod-crypto-sha1/sha256/ghash/crc32c`、`kmod-lib-crc32c` | AES-NI 官方基线已 `=y`；SHA-NI/GHASH/CRC32C 缺失。**用包而非强写 `=y`**：`crypto.mk` 里加速变体本身就是 kmod 子变体，强写 `=y` 会让对应 `.ko` 消失 → 触发"missing .ko"（QAT SDK 的失败模式） | `ls /lib/modules/$(uname -r) \| grep -E 'sha256\|ghash\|crc32c'` |
 | `30-microcode` | `intel-microcode`、`iucode-tool` | feed 实测存在；内核 `CONFIG_MICROCODE=y` 已内建。Denverton 长周期 SoC，BIOS 微码往往落后 | `dmesg \| grep -i microcode`；`grep microcode /proc/cpuinfo` |
 
@@ -73,19 +78,23 @@
 feed 实测无 `ovmf` / `edk2-ovmf` 包（宿主自身也是 Legacy BIOS 启动，无 `/sys/firmware/efi`）。
 需要 UEFI / SecureBoot 固件测试时：外带 `OVMF.fd`，用 `qemu-system-x86_64 -bios OVMF.fd` 加载即可，无需进入固件。
 
-### 4.4 QAT（已有实现，但硬件前提待确认）
+### 4.4 QAT（保留；硬件前提已澄清）
 
-现有构建已把 DH895XCC QAT 打进固件（`qat-src/` + `HOST_PKGS`）。但**本次实测的这台机器 PCI 上不存在 QAT 设备**：
+现有构建已把 DH895XCC QAT 打进固件（`qat-src/` + `HOST_PKGS`）。
 
-```
-lspci -nn  →  只有 Denverton SoC + 2×Mellanox ConnectX-4 Lx + Intel X553
-无任何 [0b40] Processing accelerators；/lib/firmware 无 qat_*.bin
-```
+本次实测这台机器 `lspci` 无任何 `[0b40] Processing accelerators`，**原因是 BIOS 里 QAT 未启用**（用户确认），并非硬件缺失 —— 早期报告中 `0000:01:00.0 = 8086:19e2` 的记录正是 BIOS 打开后的形态；内存 7.6 GB → 31.2 GB 是后续加装。
 
-而 `FIRMWARE-REPORT-2026-09-20.md` 记录的是 `0000:01:00.0 = 8086:19e2`（QAT）+ 7.6 GB 内存，本机 `01:00.0` 是 Mellanox、内存 31.2 GB。
-**待确认**：QAT 是给另一台同型号机器编的，还是当年的硬件识别有误。在确认前，建议给 QAT 加载加一道运行时门控（无设备时不 modprobe），避免无谓报错。
+**结论：QAT 保持保留，不需要改动。** BIOS 打开后设备即出现，`/etc/modules.d/40-qat` 会加载驱动。
+可选加固（非必须）：在 `40-qat` 加载前判断 `lspci`/sysfs 是否有该设备，避免未开 BIOS 时产生无谓的加载日志。
 
-### 4.5 运行期调优（不属于编译期，已在别处）
+### 4.5 UEFI / Legacy 双启动：已就绪，切换属运维动作
+
+- 两种启动方式共用同一套 GRUB 生成逻辑（`target/linux/x86/image/Makefile` 的 `Build/grub-config`），故**串口控制台与 `CONFIG_GRUB_BOOTOPTS`（含新增的 `intel_iommu=on iommu=pt`）在 UEFI 下同样生效**；`CONFIG_EFI_PARTITION=y` 已内建。
+- 每次构建同时产出 `*-combined.img.gz`（Legacy）与 `*-combined-efi.img.gz`（UEFI），随时可切回。
+- 切 UEFI 的步骤：BIOS 关 CSM/Legacy → 写 `*-combined-efi.img.gz`（先备份 `/etc/config`）→ `efibootmgr -v` 查看、`efibootmgr -o` 调整启动顺序。
+- 因此"后续优先 UEFI 启动"**不需要再改编译配置**，只需换镜像 + BIOS 设置。
+
+### 4.6 运行期调优（不属于编译期，已在别处）
 
 `host-files/etc/sysctl.conf` 已固化 BBR + fq_codel + 收发缓冲 + 脏页回写/zram 策略；conntrack 上限 262144（当前使用 2427）无需调整；网卡均为 16 队列 RSS。
 
@@ -104,9 +113,13 @@ lspci -nn  →  只有 Denverton SoC + 2×Mellanox ConnectX-4 Lx + Intel X553
 刷机后自查（固件内已开 `IKCONFIG_PROC`）：
 
 ```sh
-zgrep -E 'SERIAL_8250_MID|HSU_DMA|NR_UARTS|CONFIG_HZ' /proc/config.gz
+zgrep -E 'SERIAL_8250_MID|HSU_DMA|NR_UARTS|CONFIG_HZ|INTEL_IOMMU' /proc/config.gz
 ls -l /dev/kvm && lsmod | grep -E 'kvm|vhost'
 dmesg | grep -i microcode
+# BIOS 打开 VT-d 后:
+ls /sys/kernel/iommu_groups/ && ls /sys/class/iommu/ && ls /sys/bus/pci/drivers/vfio-pci
+# 切到 UEFI 启动后:
+ls /sys/firmware/efi && efibootmgr -v
 ```
 
 ---
@@ -114,6 +127,7 @@ dmesg | grep -i microcode
 ## 六、下一步（按收益排序）
 
 1. 跑一次源码构建，验证片段机制在 CI 里端到端可用（闸门 2/5 是新增断言，首次必须实测）。
-2. 用 `FEATURES=40-net-tune` 做一次 A/B，再决定 HZ 是否转默认。
-3. 就 QAT 硬件归属给出结论（4.4），据此决定保留或加运行时门控。
-4. 固件虚拟机工作流（KVM 已备）：qcow2 模板 + 快照回滚 + `-nographic` 串口日志，用于自编译固件/驱动的启动验证。
+2. **BIOS 里打开 VT-d 与 QAT** → 按第五节自查命令核验 IOMMU 组与 QAT 设备是否如期出现（这是"预留"是否奏效的唯一判据）。
+3. 用 `FEATURES=40-net-tune` 做一次 A/B，再决定 HZ 是否转默认。
+4. UEFI 切换演练（可选，需要重启进 BIOS）：关 CSM → 写 `*-combined-efi.img.gz` → `efibootmgr` 确认顺序；失败可回写 Legacy 镜像。
+5. 固件虚拟机工作流（KVM 已备）：qcow2 模板 + 快照回滚 + `-nographic` 串口日志，用于自编译固件/驱动的启动验证；需要直通网卡时走 15-iommu-vtd 的 vfio-pci 绑定。
