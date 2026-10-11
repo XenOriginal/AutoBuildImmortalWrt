@@ -14,7 +14,7 @@
 | 安卓式 **Virtual A/B 不可行** | 需要 update_engine / boot_control / dm-snapshot 整套栈；OpenWrt 完全没有，等于自研 OTA 框架 |
 | **物理 A/B 双槽可行** | GRUB 提供 `load_env`/`save_env`；feed 有 `grub2-editenv`；x86 target 的升级路径可替换 |
 | **不依赖 UEFI** | `sda` 在 `ata8`（SATA M.2），AHCI 已内建 → Legacy BIOS 可直接引导 SSD。UEFI 可后续单独切 |
-| **必须打一个补丁** | 官方 `package/boot/grub2/Makefile` 生成 core.img/bootx64.efi 的模块列表是 `at_keyboard biosdisk boot chain configfile fat linux ls part_gpt reboot search serial test vga` —— **没有 `loadenv`/`saveenv`**。目标机也没有 `grub-mkimage`（grub2 包只装 `lib/apk/packages/grub2.list`），只能在构建期补 |
+| **必须打一个补丁** | 官方 `package/boot/grub2/Makefile` 生成 core.img/bootx64.efi 的模块列表是 `at_keyboard biosdisk boot chain configfile fat linux ls part_gpt reboot search serial test vga` —— **没有 `loadenv`**。目标机也没有 `grub-mkimage`（grub2 包只装 `lib/apk/packages/grub2.list`），只能在构建期补。**实测教训**：GRUB 没有独立的 `saveenv` 模块，`load_env`/`save_env` 同属 `loadenv.mod`；写成 `loadenv saveenv` 会让 grub-mkimage 直接报错，已只加 `loadenv` 并用真实 grub-mkimage 对 i386-pc 与 x86_64-efi 两份列表验证通过 |
 | **当前生产形态** | 整套系统跑在 U 盘 `sdb`（"Speichern Stick"，`ata`→usb），`sda`（477 G SATA SSD）**完全空白**（前 512 B 全 0）。Docker/NFS/jellyfin/HA 全部依赖这根 U 盘 |
 
 ---
@@ -82,7 +82,7 @@ GRUB: 读 grubenv → default=1（槽 B），清空 next_entry
 
 | 改动 | 位置 | 作用 |
 | --- | --- | --- |
-| grub2 模块补丁 | `ab/patches/0001-grub2-embed-loadenv-saveenv.patch`（构建时 `patch -p1`，dry-run 先行，失败即停） | 让 core.img / bootx64.efi 内嵌 `loadenv`+`saveenv` |
+| grub2 模块补丁 | `ab/patches/0001-grub2-embed-loadenv-saveenv.patch`（构建时 `patch -p1`，dry-run 先行，失败即停） | 让 core.img / bootx64.efi 内嵌 `loadenv`（其中含 `load_env` + `save_env` 两个命令） |
 | `grub2-editenv` 包 | 特性片段 `17-grub-ab` | 系统侧读写 grubenv |
 | 引导模板 | `ab/grub.cfg.ab.tmpl` | 双槽菜单 + grubenv 回滚逻辑 |
 | 安装器 / 升级器 / 启动标记 | `ab/`（下一步提交） | 铺盘、升级、健康标记、状态查询 |

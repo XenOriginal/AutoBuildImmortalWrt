@@ -63,7 +63,13 @@ cd "$SRC_DIR"
 #   没有 loadenv / saveenv:
 #       at_keyboard biosdisk boot chain configfile fat linux ls part_gpt reboot search serial test vga
 #   目标机上也没有 grub-mkimage (grub2 包只带 lib/apk/packages/grub2.list),
-#   所以只能在构建期把这两个模块编进 core.img。补丁随仓库携带, 构建时打上。
+#   所以只能在构建期把 loadenv 模块编进 core.img。补丁随仓库携带, 构建时打上。
+#
+#   【实测教训】GRUB 里并没有独立的 saveenv 模块: load_env 与 save_env 两个
+#   命令同属 loadenv.mod。最初把模块列表写成 "loadenv saveenv", 用真实
+#   grub-mkimage 验证时直接失败 (cannot open .../saveenv.mod)。已改为只加
+#   loadenv, 并用真实 grub-mkimage 对 BIOS(i386-pc) 与 EFI(x86_64-efi) 两份
+#   列表逐一验证通过。
 #
 # 【失败即停】
 #   先 --dry-run: 上游 Makefile 一变就当场失败 —— 宁可不出固件, 也不要一个
@@ -80,11 +86,11 @@ for p in "$SCRIPT_DIR"/ab/patches/*.patch; do
     patch -p1 < "$p" >/dev/null
 done
 shopt -u nullglob
-if ! grep -q 'loadenv saveenv' package/boot/grub2/Makefile; then
+if ! grep -q 'part_gpt reboot search serial test vga loadenv' package/boot/grub2/Makefile; then
     echo "!!! grub2 模块补丁未生效 —— A/B 自动回滚会失效, 终止"
     exit 1
 fi
-echo "    OK: core.img / bootx64.efi 将内嵌 loadenv + saveenv"
+echo "    OK: core.img / bootx64.efi 将内嵌 loadenv (load_env + save_env)"
 
 # ---------------------------------------------------------------------------
 # 1.5 注入宿主机自定义 rootfs 覆盖层 (files/)
