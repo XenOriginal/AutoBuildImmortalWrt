@@ -24,3 +24,6 @@
 
 # Intel CPU 微码更新 (Denverton 勘误, 安全与稳定性)
 30-microcode
+
+# 硬件适配补全: 看门狗(挂死自动重启) + 温度/SSD 健康巡检
+35-hw-health

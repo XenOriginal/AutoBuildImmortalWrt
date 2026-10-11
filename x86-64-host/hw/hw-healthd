@@ -1,0 +1,37 @@
+#!/bin/sh /etc/rc.common
+# ============================================================================
+# 周期健康巡检服务: 每 INTERVAL 秒调用一次 hw-health -q (仅异常时输出)
+#
+# 与 hw-watchdog 分工:
+#   hw-watchdog → 挂死自动重启 (硬件看门狗)
+#   hw-healthd  → 温度/SSD/overlay 趋势与告警 (写 syslog, 可被监控采集)
+#
+# 顺序: START=97 > hw-watchdog(96) > ab-bootok(95), 保证 A/B 启动标记最先完成。
+# ============================================================================
+
+START=97
+STOP=03
+USE_PROCD=0
+
+INTERVAL=${AB_HEALTH_INTERVAL:-900}   # 默认 15 分钟
+PID=/var/run/hw-healthd.pid
+
+start() {
+    command -v /usr/sbin/hw-health >/dev/null 2>&1 || return 0
+    (
+        # 首次稍作延迟, 等系统与服务就绪
+        sleep 60
+        while :; do
+            /usr/sbin/hw-health -q >/dev/null 2>&1 || true
+            sleep "$INTERVAL"
+        done
+    ) &
+    echo $! > "$PID"
+    logger -t hw-healthd "健康巡检已启动 (每 ${INTERVAL}s)"
+}
+
+stop() {
+    [ -f "$PID" ] && kill "$(cat "$PID")" 2>/dev/null
+    rm -f "$PID"
+    logger -t hw-healthd "健康巡检已停止"
+}

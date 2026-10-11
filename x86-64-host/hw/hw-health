@@ -1,0 +1,66 @@
+#!/bin/sh
+# ============================================================================
+# 硬件健康巡检 (可单独执行, 也被 hw-health 服务周期调用)
+#
+#   检查: CPU/环境温度、SSD SMART 健康、overlay 使用率、内存与 zram
+#   输出: 人可读摘要 -> stdout; 异常项同时写 syslog (logger -t hw-health)
+#
+#   退出码: 0 = 全部正常; 1 = 有告警 (便于脚本/监控接入)
+#
+# 用法: hw-health            # 打印摘要
+#       hw-health -q         # 只输出异常 (给周期任务用)
+# ============================================================================
+set -u
+
+QUIET=0
+[ "${1:-}" = "-q" ] && QUIET=1
+
+WARN=0
+say()  { [ "$QUIET" = 1 ] || echo "$*"; }
+warn() { echo "$*" >&2; logger -t hw-health "$*"; WARN=1; }
+
+# ---- 温度 ----
+TEMP_WARN=${TEMP_WARN:-70}
+for hz in /sys/class/thermal/thermal_zone*; do
+    [ -e "$hz/temp" ] || continue
+    t=$(cat "$hz/temp" 2>/dev/null)
+    [ -n "${t:-}" ] || continue
+    tc=$((t / 1000))
+    name=$(cat "$hz/type" 2>/dev/null || echo thermal)
+    say "温度  $name: ${tc}°C"
+    [ "$tc" -ge "$TEMP_WARN" ] && warn "温度告警: $name ${tc}°C >= ${TEMP_WARN}°C"
+done
+if [ -r /sys/class/hwmon/hwmon1/temp1_input ]; then
+    tc=$(( $(cat /sys/class/hwmon/hwmon1/temp1_input) / 1000 ))
+    say "温度  coretemp Package: ${tc}°C"
+    [ "$tc" -ge "$TEMP_WARN" ] && warn "温度告警: coretemp ${tc}°C >= ${TEMP_WARN}°C"
+fi
+
+# ---- SSD / 磁盘 SMART ----
+if command -v smartctl >/dev/null 2>&1; then
+    for d in /dev/sda /dev/sdb /dev/nvme0; do
+        [ -b "$d" ] || continue
+        h=$(smartctl -H "$d" 2>/dev/null | grep -E "SMART overall-health|SMART Health Status" | head -1)
+        case "$h" in
+            *PASSED*|*OK*) say "健康  $d: ${h#*: }" ;;
+            "")            say "健康  $d: (无 SMART 结论, 可能不支持)" ;;
+            *)             warn "SMART 告警: $d -> $h" ;;
+        esac
+    done
+fi
+
+# ---- overlay 使用率 ----
+if [ -d /overlay ]; then
+    u=$(df -h /overlay 2>/dev/null | awk 'NR==2{print $5}' | tr -d '%')
+    if [ -n "${u:-}" ]; then
+        say "overlay 使用率: ${u}%"
+        [ "$u" -ge 90 ] && warn "overlay 使用率告警: ${u}% >= 90%"
+    fi
+fi
+
+# ---- 内存 / zram ----
+# busybox 的 free/swapon 输出单位是 KB
+say "内存: $(free 2>/dev/null | awk 'NR==2{printf "used %dMB / total %dMB", $3/1024, $2/1024}')"
+say "zram: $(swapon -s 2>/dev/null | awk 'NR==2{printf "%s 已用 %dMB / 共 %dMB", $1, $4/1024, $3/1024}')"
+
+exit "$WARN"

@@ -166,6 +166,25 @@ done
 echo "  OK: A/B 工具已就位 (含 /etc/rc.d/S95ab-bootok 自启链接)"
 
 # ---------------------------------------------------------------------------
+# 1.7 安装硬件适配工具 (看门狗 + 健康巡检)
+#
+#   与 A/B 的启动顺序约束: ab-bootok(95) < hw-watchdog(96) < hw-healthd(97)。
+#   喂狗器还会额外等 boot_ok=1 才 arm, 避免新槽启动失败被反复重启、
+#   掩盖 GRUB 的回滚判定。
+# ---------------------------------------------------------------------------
+echo ">>> 安装硬件适配工具 (hw-watchdog / hw-health / hw-healthd)..."
+install -m 0755 "$SCRIPT_DIR/hw/hw-watchdog" "$SRC_DIR/files/etc/init.d/hw-watchdog"
+install -m 0755 "$SCRIPT_DIR/hw/hw-healthd"  "$SRC_DIR/files/etc/init.d/hw-healthd"
+install -m 0755 "$SCRIPT_DIR/hw/hw-health"   "$SRC_DIR/files/usr/sbin/hw-health"
+ln -sf ../init.d/hw-watchdog "$SRC_DIR/files/etc/rc.d/S96hw-watchdog"
+ln -sf ../init.d/hw-healthd  "$SRC_DIR/files/etc/rc.d/S97hw-healthd"
+for f in etc/init.d/hw-watchdog etc/init.d/hw-healthd usr/sbin/hw-health \
+         etc/rc.d/S96hw-watchdog etc/rc.d/S97hw-healthd; do
+    [ -e "$SRC_DIR/files/$f" ] || { echo "!!! 硬件适配工具安装失败: $f"; exit 1; }
+done
+echo "  OK: 硬件适配工具已就位 (S96hw-watchdog / S97hw-healthd)"
+
+# ---------------------------------------------------------------------------
 # 2. 注入自定义 QAT 包
 # ---------------------------------------------------------------------------
 echo ">>> 注入 QAT 驱动包与固件包..."

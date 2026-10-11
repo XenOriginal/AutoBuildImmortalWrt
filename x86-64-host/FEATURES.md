@@ -38,6 +38,7 @@
 | `15-iommu-vtd` | `kmod-vfio`、`kmod-vfio-pci` + 内核 `INTEL_IOMMU=y`、`INTEL_IOMMU_DEFAULT_ON=y`、`IRQ_REMAP=y` | 见上文"VFIO/VT-d"两行实测；配套命令行 `intel_iommu=on iommu=pt` 写在 `build-source.sh` §4.2 | BIOS 开 VT-d 后：`ls /sys/kernel/iommu_groups/`、`ls /sys/class/iommu/`、`ls /sys/bus/pci/drivers/vfio-pci` |
 | `20-crypto-accel` | `kmod-crypto-sha1/sha256/ghash/crc32c`、`kmod-lib-crc32c` | AES-NI 官方基线已 `=y`；SHA-NI/GHASH/CRC32C 缺失。**用包而非强写 `=y`**：`crypto.mk` 里加速变体本身就是 kmod 子变体，强写 `=y` 会让对应 `.ko` 消失 → 触发"missing .ko"（QAT SDK 的失败模式） | `ls /lib/modules/$(uname -r) \| grep -E 'sha256\|ghash\|crc32c'` |
 | `30-microcode` | `intel-microcode`、`iucode-tool` | feed 实测存在；内核 `CONFIG_MICROCODE=y` 已内建。Denverton 长周期 SoC，BIOS 微码往往落后 | `dmesg \| grep -i microcode`；`grep microcode /proc/cpuinfo` |
+| `35-hw-health` | `kmod-itco-wdt`、`kmod-hwmon-coretemp`、`smartmontools`、`lm-sensors` | 实测：`iTCO_wdt.ko` 在固件里但 `/dev/watchdog` 不存在、无喂狗服务（整机挂死只能断电），而本机历史上出现过 D 状态挂死；SSD 为 SAMSUNG MZMTE512HMHP（TRIM 可用，smartctl 可读） | `ls -l /dev/watchdog`；`logread \| grep hw-watchdog`；`hw-health`；`smartctl -H /dev/sda` |
 
 三项片段在 `[meta] expect_pkgs=` 中自报验收标准，**闸门 5** 会用固件 `.manifest` 逐包断言，缺包直接判定构建失败。
 
@@ -86,6 +87,31 @@ feed 实测无 `ovmf` / `edk2-ovmf` 包（宿主自身也是 Legacy BIOS 启动�
 
 **结论：QAT 保持保留，不需要改动。** BIOS 打开后设备即出现，`/etc/modules.d/40-qat` 会加载驱动。
 可选加固（非必须）：在 `40-qat` 加载前判断 `lspci`/sysfs 是否有该设备，避免未开 BIOS 时产生无谓的加载日志。
+
+### 4.4b 看门狗与健康巡检（已实现，见 features/35-hw-health）
+
+**为什么必须有**：实测这台机器 `iTCO_wdt.ko` 已随固件，但 `/dev/watchdog` 不存在、
+也没有任何喂狗服务 —— 即"整机挂死只能靠人到场断电"。而 `host-files/etc/sysctl.conf`
+里那组脏页回写限制，正是为历史上出现过的 **D 状态整机挂死**加的。生产环境应有
+"挂死自动重启"。
+
+实现（`x86-64-host/hw/`，构建时装入固件）：
+
+| 组件 | 启动序 | 作用 |
+| --- | --- | --- |
+| `ab-bootok` | 95 | A/B：健康检查通过才写 `boot_ok=1` |
+| `hw-watchdog` | 96 | 等 `boot_ok=1` 后打开 `/dev/watchdog` 每 5s 喂狗；TERM 时写魔数 `V` 解除武装 |
+| `hw-healthd` + `hw-health` | 97 | 每 15 min 巡检温度 / SSD SMART / overlay 使用率，异常写 syslog（可被监控采集） |
+
+**顺序约束（关键）**：喂狗器必须在 `ab-bootok` 之后、且**等到 `boot_ok=1` 才 arm** ——
+否则新槽启动失败会被看门狗反复重启，掩盖 GRUB 的失败回滚判定。
+
+**迁移前基线（实测）**：`smartctl -H /dev/sda` = **PASSED**（目标 SSD 健康）；
+USB 盘 `sdb` 无 SMART 结论（U 盘通常不支持，这也是应尽快迁移的原因之一）。
+
+**实测参数**：`/dev/watchdog` 打开即计时；内核 `watchdog_thresh` 默认 10s，
+iTCO 常用 2×阈值 ≈ 20s，故喂狗间隔取 5s 留足余量。`kill -9` 喂狗进程会跳过
+魔数关闭 → 硬件超时后重启机器，这是看门狗的设计语义而非缺陷。
 
 ### 4.5 UEFI / Legacy 双启动：已就绪，切换属运维动作
 
