@@ -43,8 +43,8 @@ command -v grub-editenv >/dev/null 2>&1 || ab_die "缺少 grub-editenv (请启�
 
 # 必须先确保 /boot 就位: 设备侧工具不能假设 fstab 已经把 /boot 挂好
 # (实测: 官方镜像在 QEMU 里 /boot 就是未挂载状态, grubenv 自然找不到)
-ab_ensure_boot || ab_die "无法挂载 /boot (找不到 LABEL=kernel 的分区?)"
-[ -f "$AB_ENV" ] || ab_die "缺少 $AB_ENV (本机不是 A/B 布局?)"
+AB_ENV=$(ab_env_path) || ab_die "找不到 grubenv (内核分区未挂载/不是 A/B 布局?)"
+KDIR=$(ab_kernel_dir) || ab_die "无法定位内核目录"
 
 BOOT_DEV=$(ab_boot_dev)
 [ -n "$BOOT_DEV" ] || ab_die "/boot 不可用"
@@ -64,7 +64,8 @@ esac
 ABOUT=$(cat /tmp/sysinfo/model 2>/dev/null || true)
 ab_info "A/B 升级"
 echo "    磁盘      : $DISK"
-echo "    当前槽    : $CUR ($(blkid -s PARTUUID -o value "$([ "$CUR" = A ] && echo "$SLOT_A_DEV" || echo "$SLOT_B_DEV")" 2>/dev/null))"
+CUR_IDX=3; [ "$CUR" = B ] && CUR_IDX=4
+echo "    当前槽    : $CUR ($(ab_partuuid_gpt "$DISK" "$CUR_IDX" 2>/dev/null))"
 echo "    目标槽    : $TGT ($TGT_DEV)"
 echo "    镜像      : $IMAGE ($(stat -c%s "$IMAGE" 2>/dev/null || echo '?') 字节)"
 echo "    overlay   : $([ "$MIGRATE" = 1 ] && echo '迁移' || echo '不迁移(新槽将使用默认配置)')"
@@ -101,7 +102,7 @@ fi
 # ---------------------------------------------------------------------------
 # 2. 内核 -> /boot/vmlinuz.<目标槽>
 # ---------------------------------------------------------------------------
-ab_info "写入内核 -> /boot/vmlinuz.$TGT_LETTER"
+ab_info "写入内核 -> $KDIR/vmlinuz.$TGT_LETTER"
 mkdir -p "$WORK/mnt"
 mounted=0
 for t in vfat ext4 auto; do
@@ -109,9 +110,9 @@ for t in vfat ext4 auto; do
 done
 [ "$mounted" = 1 ] || ab_die "挂载镜像 p1 失败"
 [ -f "$WORK/mnt/boot/vmlinuz" ] || ab_die "镜像 p1 内没有 /boot/vmlinuz"
-cp "$WORK/mnt/boot/vmlinuz" "/boot/vmlinuz.$TGT_LETTER.new"
+cp "$WORK/mnt/boot/vmlinuz" "$KDIR/vmlinuz.$TGT_LETTER.new"
 umount "$WORK/mnt"
-mv "/boot/vmlinuz.$TGT_LETTER.new" "/boot/vmlinuz.$TGT_LETTER"
+mv "$KDIR/vmlinuz.$TGT_LETTER.new" "$KDIR/vmlinuz.$TGT_LETTER"
 sync
 
 # ---------------------------------------------------------------------------
@@ -131,17 +132,18 @@ if [ "$MIGRATE" = 1 ]; then
         ab_warn "找不到 /overlay, 跳过 overlay 迁移 (新槽将使用默认配置)"
     else
         OFF=$(ab_overlay_offset "$TGT_DEV") || ab_die "无法计算 overlay 偏移"
-        ab_info "迁移 overlay: $OVL -> $TGT_DEV+$OFF"
-        NEWLOOP=$(losetup -f)
-        losetup -o "$OFF" "$NEWLOOP" "$TGT_DEV" || ab_die "losetup 失败"
-        mkfs.f2fs -f "$NEWLOOP" >/dev/null 2>&1 || mkfs.f2fs "$NEWLOOP" >/dev/null 2>&1 \
-            || ab_die "在新槽创建 f2fs 失败"
-        mount -t f2fs "$NEWLOOP" "$WORK/mnt" || ab_die "挂载新槽 overlay 失败"
-        ( cd "$OVL" && tar -cf - . ) | tar -C "$WORK/mnt" -xf - || ab_die "复制 overlay 内容失败"
-        sync
-        umount "$WORK/mnt"
-        losetup -d "$NEWLOOP"
-        NEWLOOP=""
+        # 新 overlay 大小: 取"当前占用 x2"与下限 512MiB 的较大者, 且不超过槽剩余空间
+        USED_MIB=$(du -sm "$OVL" 2>/dev/null | awk '{print $1}')
+        [ -n "$USED_MIB" ] || USED_MIB=256
+        SLOT_MIB=$(($(cat "/sys/class/block/$(basename "$TGT_DEV")/size") / 2048))
+        AVAIL_MIB=$(( SLOT_MIB - OFF / 1048576 - 8 ))
+        OVL_MIB=$(( USED_MIB * 2 ))
+        [ "$OVL_MIB" -lt 512 ] && OVL_MIB=512
+        [ "$OVL_MIB" -gt "$AVAIL_MIB" ] && OVL_MIB=$AVAIL_MIB
+        [ "$OVL_MIB" -gt 64 ] || ab_die "槽剩余空间不足 (剩余 ${AVAIL_MIB} MiB)"
+
+        ab_info "迁移 overlay: $OVL (${USED_MIB} MiB) -> $TGT_DEV + $OFF (新建 ${OVL_MIB} MiB f2fs)"
+        ab_seed_overlay "$TGT_DEV" "$OFF" "$OVL_MIB" "$OVL" || ab_die "建立/填充目标槽 overlay 失败"
         ab_info "overlay 迁移完成"
     fi
 fi

@@ -69,8 +69,26 @@
 | **GRUB 回写 grubenv（`save_env`）** | ✅ 启动后 `next_entry` 被清空、`bootcount=1`、`default=1` 落盘 |
 | **连续失败自动回滚** | ✅ `boot_ok=0`：第 2 次启动计数升到 2；第 3 次启动**自动切回槽 A**（`default=0`），无需人工干预 |
 | 两槽均可独立启动 | ✅ 槽 A / 槽 B 都实际启动到网络就绪 |
+| **槽 A → 槽 B 完整升级** | ✅ 来宾内执行 `ab-upgrade`：写槽 B + 迁移 overlay + 置 `next_entry=1`；重启后命令行指向**槽 B 的 PARTUUID** |
+| **配置随槽迁移（关键）** | ✅ 升级前在槽 A 写入标记 `MIGRATE-CHECK-12345`；升级后槽 B 的 overlay 内该标记存在（回滚目标槽 A 的 overlay 同时完好） |
 
-结论：**A/B 核心机制（布局、引导、一次性切换、失败自动回滚）已在真机等价环境验证通过。**
+结论：**A/B 核心机制（布局、引导、一次性切换、失败自动回滚）与升级器（含 overlay 迁移）均已在真机等价环境验证通过。**
+
+### 4.1 演练中修掉的真实现缺陷（全部是"不修就会在生产上炸"的）
+1. GRUB 没有 `saveenv` 模块：`load_env`/`save_env` 同属 `loadenv.mod`，写成 `saveenv` 会让 grub-mkimage 直接失败。
+2. `/boot` 必须是分区 1：官方 core.img 的 early config 硬编码 `(hd0,gpt1)`。
+3. grubenv 必须用显式路径（`search --label kernel` 后 `load_env -f`），且串口初始化必须在 grub.cfg 最前面（否则输出只去 VGA），调试还需内嵌 `echo` 模块。
+4. **busybox `hexdump` 默认迭代单位不是 1 字节**：`-e "%02x"` 会把 8 字节读成 8 个字符 → 长度断言失败、函数静默返回空。必须写 `1/1 "%02x"`。
+5. **shell 变量泄漏**：`ab_hex_le64` 用了 `lo`/`hi` 作为临时变量却没 `local`，把调用方的循环设备变量 `lo` 覆盖成数值，导致后续所有 dd 操作指向不存在的设备。所有函数已加 `local`。
+6. **`mount -o loop,offset=` 对分区设备不可靠** → 改为"临时文件建 f2fs + 灌内容 + 整块 dd 到偏移"。
+7. **内核分区两种布局约定**：官方 core.img 要求分区内是 `boot/grub/grub.cfg`（挂到 /boot 后即 `/boot/boot/grub/grubenv`），部分镜像直接放分区根；设备侧工具两种都探测。
+8. `dd bs=1M` 无法表达非 MiB 对齐的偏移（实测 10420224 = 9.9375 MiB）→ 按 4KiB 块定位。
+
+### 4.2 设备侧依赖收敛
+为避免"最小镜像里没有 parted/blkid/losetup 就整个升级器不可用"，已改为：
+- 分区表与 PARTUUID **直接读裸 GPT/MBR 字节**（与 `blkid` 输出逐项比对一致）；
+- overlay 落盘用 `dd`，不用 losetup；
+- /boot 定位用 FAT 卷标裸读，不用 blkid。
 
 ---
 
@@ -100,7 +118,9 @@
 | `grub2-editenv` 包 | 特性片段 `17-grub-ab` | 系统侧读写 grubenv |
 | 引导模板 | `ab/grub.cfg.ab.tmpl` | 双槽菜单 + grubenv 一次性引导与回退 |
 | 安装器 | `ab/ab-layout.sh`（已演练） | 铺盘、双槽、装 GRUB、初始化 grubenv |
-| 升级器/启动标记/状态 | `ab/ab-upgrade`、`ab/ab-bootok`、`ab-status`（待实现） | 写非活动槽 + 迁移 overlay；健康后标记成功 |
+| 升级器 | `ab/ab-upgrade`（已演练） | 写非活动槽 + 迁移 overlay + 置一次性引导与回滚状态 |
+| 启动标记 / 状态 | `ab/ab-bootok`、`ab/ab-status` | 健康后写 `boot_ok=1`；状态一览 |
+| 设备侧公共库 | `ab/ab-lib.sh` | 裸分区表解析、overlay 偏移、路径兼容、槽识别 |
 | 硬件适配补全 | 特性片段（待实现） | `kmod-itco-wdt` + 喂狗服务、温度阈值、SSD SMART 巡检 |
 
 ---

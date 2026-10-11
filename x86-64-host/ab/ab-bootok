@@ -24,16 +24,21 @@ START=95
 STOP=10
 USE_PROCD=0
 
-AB_ENV=/boot/grub/grubenv
 AB_LOG=/etc/ab.log
+AB_ENV=/boot/grub/grubenv
 AB_WAIT=${AB_WAIT:-180}      # 最长等待秒数
 AB_PING=${AB_PING:-1.1.1.1}  # 备用可达性探测 (可选, 失败不致命)
 
 log() { echo "$(date '+%Y-%m-%d %H:%M:%S') ab-bootok: $*" >> "$AB_LOG"; }
 
 start() {
-    [ -f "$AB_ENV" ] || { log "无 $AB_ENV, 非 A/B 布局, 跳过"; return 0; }
     command -v grub-editenv >/dev/null 2>&1 || { log "缺 grub-editenv, 跳过"; return 0; }
+    # 复用公共库解析 grubenv 路径 (兼容内核分区的两种布局约定)
+    [ -f /usr/lib/ab-lib.sh ] && . /usr/lib/ab-lib.sh
+    if command -v ab_env_path >/dev/null 2>&1; then
+        AB_ENV=$(ab_env_path) || { log "找不到 grubenv, 非 A/B 布局, 跳过"; return 0; }
+    fi
+    [ -f "$AB_ENV" ] || { log "无 $AB_ENV, 非 A/B 布局, 跳过"; return 0; }
 
     if [ "$(grub-editenv "$AB_ENV" list 2>/dev/null | sed -n 's/^boot_ok=//p' | head -1)" = "1" ]; then
         log "boot_ok 已为 1, 无需改动"
