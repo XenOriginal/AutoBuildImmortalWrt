@@ -55,6 +55,38 @@ fi
 cd "$SRC_DIR"
 
 # ---------------------------------------------------------------------------
+# 1.2 应用仓库携带的源码补丁 (ab/patches/*.patch)
+#
+# 【为什么需要】
+#   单盘 A/B 自升级依赖 GRUB 读写 grubenv (load_env / save_env)。而官方
+#   package/boot/grub2/Makefile 生成 core.img / bootx64.efi 时内嵌的模块列表里
+#   没有 loadenv / saveenv:
+#       at_keyboard biosdisk boot chain configfile fat linux ls part_gpt reboot search serial test vga
+#   目标机上也没有 grub-mkimage (grub2 包只带 lib/apk/packages/grub2.list),
+#   所以只能在构建期把这两个模块编进 core.img。补丁随仓库携带, 构建时打上。
+#
+# 【失败即停】
+#   先 --dry-run: 上游 Makefile 一变就当场失败 —— 宁可不出固件, 也不要一个
+#   "编译看着成功、实则无法自动回滚" 的固件。
+# ---------------------------------------------------------------------------
+echo ">>> 应用源码补丁 (ab/patches)..."
+shopt -s nullglob
+for p in "$SCRIPT_DIR"/ab/patches/*.patch; do
+    echo "    补丁: $(basename "$p")"
+    if ! patch -p1 --dry-run < "$p" >/dev/null 2>&1; then
+        echo "!!! 补丁无法应用 (上游可能已变更): $(basename "$p")"
+        exit 1
+    fi
+    patch -p1 < "$p" >/dev/null
+done
+shopt -u nullglob
+if ! grep -q 'loadenv saveenv' package/boot/grub2/Makefile; then
+    echo "!!! grub2 模块补丁未生效 —— A/B 自动回滚会失效, 终止"
+    exit 1
+fi
+echo "    OK: core.img / bootx64.efi 将内嵌 loadenv + saveenv"
+
+# ---------------------------------------------------------------------------
 # 1.5 注入宿主机自定义 rootfs 覆盖层 (files/)
 #
 # 【为什么必须在源码树里, 而不是 /work/files】

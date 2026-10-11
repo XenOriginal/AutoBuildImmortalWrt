@@ -16,6 +16,9 @@
 # VT-d/IOMMU 直通能力预留 (Intel IOMMU 默认开 + VFIO; BIOS 打开 VT-d 即可用)
 15-iommu-vtd
 
+# A/B 安全自升级: GRUB grubenv 工具 (配套构建期补丁见 ab/patches/)
+17-grub-ab
+
 # 加密/校验内核模块 (SHA-1/SHA-256/GHASH/CRC32C; AES-NI 官方基线已内建)
 20-crypto-accel
 
