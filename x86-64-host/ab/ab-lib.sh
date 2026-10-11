@@ -19,7 +19,26 @@ ab_info() { echo ">>> $*"; }
 ab_warn() { echo "  !! $*" >&2; }
 ab_die()  { echo "!!! $*" >&2; exit 1; }
 
-ab_strip_part() { echo "$1" | sed -e 's/p\?[0-9]*$//'; }
+# 去掉分区号, 得到整盘设备名。
+# 注意不能用 sed 's/p\?[0-9]*$//': 它会把 /dev/loop3 误裁成 /dev/loo
+# (把结尾的 "p3" 当成分区后缀), 从而让"源/目标同盘"这类安全判断失效。
+ab_strip_part() { # $1=/dev/sda1 | /dev/loop1p3 | /dev/loop3 | /dev/nvme0n1p2
+    local d=$1 bb pre
+    case "$d" in
+        *p[0-9]|*p[0-9][0-9]|*p[0-9][0-9][0-9])
+            pre=${d%p*}
+            # 只有 'p' 前是数字或 'n' 时才当分区后缀 (排除 /dev/loop3 里的 "p3")
+            case "$pre" in
+                *[0-9]|*n) echo "$pre" ;;
+                *) echo "$d" ;;
+            esac ;;
+        /dev/sd[a-z][0-9]*|/dev/hd[a-z][0-9]*|/dev/vd[a-z][0-9]*)
+            bb=$d
+            while :; do case "$bb" in *[0-9]) bb=${bb%[0-9]} ;; *) break ;; esac; done
+            echo "$bb" ;;
+        *) echo "$d" ;;
+    esac
+}
 
 ab_partdev() { # $1=disk $2=num
     local c
