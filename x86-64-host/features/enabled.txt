@@ -1,0 +1,16 @@
+# 默认启用的编译期特性片段 (每行一个文件名, 不含 .conf)
+#
+# 未登记在这里的片段 = 可选优化, 默认不编入固件。
+# 需要时用环境变量临时开启 (可逗号分隔多个):
+#     FEATURES=40-net-tune,50-image-slim bash x86-64-host/build-source.sh
+#
+# 新增/删除一项优化: 只改本文件, 构建脚本主体不动。
+
+# KVM/QEMU 硬件虚拟化宿主能力 (/dev/kvm + vhost-net + VFIO + QEMU)
+10-kvm-host
+
+# 加密/校验内核模块 (SHA-1/SHA-256/GHASH/CRC32C; AES-NI 官方基线已内建)
+20-crypto-accel
+
+# Intel CPU 微码更新 (Denverton 勘误, 安全与稳定性)
+30-microcode

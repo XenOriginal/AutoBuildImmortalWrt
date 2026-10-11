@@ -15,6 +15,10 @@
 # ============================================================================
 set -euo pipefail
 
+# 本脚本所在目录 (CI 中是 /work/x86-64-host)。
+# 编译期特性片段等相对路径一律以此为基准, 不依赖调用者的 cwd。
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
 # GNU tar 等工具的 configure 会拒绝以 root 身份运行 (容器内是 root),
 # 必须显式跳过该检查, 否则 tools/tar 构建失败。
 export FORCE_UNSAFE_CONFIGURE=1
@@ -330,6 +334,16 @@ CONFIG_PACKAGE_luci-i18n-dockerman-zh-cn=y
     echo ">>> Docker 已启用"
 fi
 
+# ---- 编译期特性片段: config 阶段 (可插拔, 契约见 features/README.md) ----
+# 片段只负责"加什么优化", 构建脚本主体不再随优化项增长。
+# --stamp 写出的戳记会在编译末尾被闸门 2 / 闸门 5 复验。
+echo ">>> 应用编译期特性片段 (config 阶段)..."
+rm -f "$SRC_DIR/.features-applied"
+bash "$SCRIPT_DIR/apply-features.sh" \
+    --stage config \
+    --config "$SRC_DIR/.config" \
+    --stamp  "$SRC_DIR/.features-applied"
+
 # 写入并让 OpenWrt 解析依赖
 echo "$HOST_PKGS" >> .config
 make defconfig >>"$LOG" 2>&1
@@ -556,6 +570,15 @@ for kv in CONFIG_IKCONFIG=y CONFIG_IKCONFIG_PROC=y; do
     echo "    + $kv"
 done
 
+# ---- 编译期特性片段: kconfig 阶段 (可插拔, 契约见 features/README.md) ----
+# 与上一节写在同一个 $SUB_CONFIG (x86/64 子目标) 上; 依 include/target.mk 的
+# 合并顺序 generic → x86 → x86/64, 子目标稳定胜出, 不会污染 generic。
+echo ">>> 应用编译期特性片段 (kconfig 阶段)..."
+bash "$SCRIPT_DIR/apply-features.sh" \
+    --stage kconfig \
+    --kconfig "$SUB_CONFIG" \
+    --stamp   "$SRC_DIR/.features-applied"
+
 # ---------------------------------------------------------------------------
 # 5.8 内核合并结果断言 —— 两道闸门
 #
@@ -720,10 +743,56 @@ fi
 #   (实测: prepare 后 43 分钟), 所以真正的凭据只能在这里查。
 #   不通过就直接失败 —— 后续的产物复制与 artifact 上传都不会发生,
 #   宁可这一次不出固件, 也不流出没有串口驱动的固件。
+#
+#   同一道闸门同时复验【特性片段注入的内核符号】(.features-applied 的 kconf 行):
+#   片段应用器只保证"写进了子目标 config", 真正生效与否要看这里。
 # ---------------------------------------------------------------------------
+verify_feature_kconfig() {
+    local kcfg="$1"
+    local stamp="$SRC_DIR/.features-applied"
+    local kind feat kv sym want got bad=0
+
+    if [ ! -f "$stamp" ]; then
+        echo "    (无特性戳记 $stamp, 跳过特性内核符号复验)"
+        return 0
+    fi
+    echo ">>> 复验特性片段注入的内核符号 ($kcfg)"
+    while IFS=$'\t' read -r kind feat kv; do
+        [ "$kind" = "kconf" ] || continue
+        [ -n "${kv:-}" ] || continue
+        sym="${kv%%=*}"
+        want="${kv#*=}"
+        if [ "$want" = "n" ]; then
+            if grep -qxF "# ${sym} is not set" "$kcfg" 2>/dev/null; then
+                echo "    ✅ ${feat}: ${sym} 已关闭"
+            else
+                got=$(grep -E "^${sym}=" "$kcfg" 2>/dev/null | head -1 | cut -d= -f2- || true)
+                echo "    ❌ ${feat}: ${sym} 期望未设置, 实际 '${got:-未设置}'"
+                bad=1
+            fi
+        else
+            got=$(grep -E "^${sym}=" "$kcfg" 2>/dev/null | head -1 | cut -d= -f2- || true)
+            if [ "$got" = "$want" ]; then
+                echo "    ✅ ${feat}: ${sym}=${got}"
+            else
+                echo "    ❌ ${feat}: ${sym} 期望 '${want}', 实际 '${got:-未设置}'"
+                bad=1
+            fi
+        fi
+    done < "$stamp"
+    if [ "$bad" -ne 0 ]; then
+        echo "!!! 特性片段的内核符号未进入最终 .config (被静默丢弃?)"
+        return 1
+    fi
+}
+
 if [ -n "${KDIR:-}" ] && [ -d "$KDIR" ]; then
     verify_symbols_in "$KDIR/.config" "内核最终 .config (编译完成后)" || {
         echo "!!! 串口控制台内核配置未进入最终 .config —— 拒绝产出固件"
+        exit 1
+    }
+    verify_feature_kconfig "$KDIR/.config" || {
+        echo "!!! 特性片段的内核配置未生效 —— 拒绝产出固件"
         exit 1
     }
 else
@@ -761,6 +830,51 @@ if [ "$qat_missing" -ne 0 ]; then
     echo "!!! QAT 未进入固件 —— 拒绝产出固件"
     exit 1
 fi
+
+# ---------------------------------------------------------------------------
+# 6.6b 【闸门 5】断言特性片段声明的软件包真的进了固件
+#
+#   片段在 [meta] expect_pkgs= 里自报验收标准, 应用器把它写进
+#   .features-applied 的 pkgs 行。这里拿权威清单逐项核对:
+#   包名写错 / =m 而非 =y / 依赖未满足, 都会在这里当场暴露。
+#
+#   为什么值得单开一道: KVM/QEMU 这类"能力型"特性, 刷机后才发现缺包
+#   意味着要重刷一次固件; 而清单断言在编译末尾就能拦下。
+# ---------------------------------------------------------------------------
+verify_feature_pkgs() {
+    local manifest="$1"
+    local stamp="$SRC_DIR/.features-applied"
+    local kind feat pkgs p bad=0 n=0
+
+    if [ ! -f "$stamp" ]; then
+        echo "    (无特性戳记 $stamp, 跳过特性包断言)"
+        return 0
+    fi
+    echo ">>> 闸门 5: 断言特性片段声明的软件包已在固件内"
+    while IFS=$'\t' read -r kind feat pkgs; do
+        [ "$kind" = "pkgs" ] || continue
+        [ -n "${pkgs:-}" ] || continue
+        for p in $(printf '%s' "$pkgs" | tr ',' ' '); do
+            n=$((n + 1))
+            if grep -qE "^${p} " "$manifest"; then
+                echo "    ✅ ${feat}: ${p}"
+            else
+                echo "    ❌ ${feat}: ${p} 不在固件清单中 (检查 CONFIG_PACKAGE_* 是否为 y)"
+                bad=1
+            fi
+        done
+    done < "$stamp"
+    echo "    (共核对 ${n} 个包)"
+    if [ "$bad" -ne 0 ]; then
+        echo "!!! 特性片段声明的包未安装进固件"
+        return 1
+    fi
+}
+
+verify_feature_pkgs "$MANIFEST" || {
+    echo "!!! 特性片段验收失败 —— 拒绝产出固件"
+    exit 1
+}
 
 # ---------------------------------------------------------------------------
 # 6.7 【闸门 4】断言宿主机覆盖层与 QAT 驱动文件落在 rootfs 暂存区
