@@ -886,6 +886,37 @@ verify_feature_pkgs "$MANIFEST" || {
 }
 
 # ---------------------------------------------------------------------------
+# 6.6c 【闸门 6】双启动兼容: Legacy 与 UEFI 两份合盘镜像必须都在
+#
+#   12-uefi-boot 特性承诺"UEFI / Legacy 都能启动"。这个承诺的凭据不是配置项,
+#   而是产物: target/linux/x86 会分别产出 combined(BIOS) 与 combined-efi。
+#   只出一种 = 换启动方式就得重编固件 —— 与"双兼容"的目标直接矛盾,
+#   所以在这里当场拦下, 而不是等刷机时才发现缺一份。
+# ---------------------------------------------------------------------------
+if [ -f "$SRC_DIR/.features-applied" ] && grep -q '^pkgs[[:space:]]12-uefi-boot' "$SRC_DIR/.features-applied"; then
+    echo ">>> 闸门 6: 断言 Legacy / UEFI 两份合盘镜像都已产出 (12-uefi-boot)"
+    ART_DIR="$SRC_DIR/bin/targets/x86/64"
+    legacy_img=$(find "$ART_DIR" -maxdepth 1 -name '*-combined.img.gz' 2>/dev/null | head -1)
+    efi_img=$(find "$ART_DIR" -maxdepth 1 -name '*-combined-efi.img.gz' 2>/dev/null | head -1)
+    if [ -n "$legacy_img" ]; then
+        echo "    ✅ Legacy 镜像: $(basename "$legacy_img")"
+    else
+        echo "    ❌ 缺少 Legacy 合盘镜像 (*-combined.img.gz)"
+    fi
+    if [ -n "$efi_img" ]; then
+        echo "    ✅ UEFI   镜像: $(basename "$efi_img")"
+    else
+        echo "    ❌ 缺少 UEFI 合盘镜像 (*-combined-efi.img.gz)"
+    fi
+    if [ -z "$legacy_img" ] || [ -z "$efi_img" ]; then
+        echo "!!! 双启动镜像不完整 —— 拒绝产出固件"
+        exit 1
+    fi
+else
+    echo ">>> 闸门 6: 未启用 12-uefi-boot, 跳过多启动镜像断言"
+fi
+
+# ---------------------------------------------------------------------------
 # 6.7 【闸门 4】断言宿主机覆盖层与 QAT 驱动文件落在 rootfs 暂存区
 #
 #   闸门 3 只能证明"包被安装了", 不能证明"files/ 覆盖层被 prepare_rootfs 应用"。
