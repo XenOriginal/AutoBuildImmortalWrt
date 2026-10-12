@@ -679,6 +679,20 @@ done
 # 与上一节写在同一个 $SUB_CONFIG (x86/64 子目标) 上; 依 include/target.mk 的
 # 合并顺序 generic → x86 → x86/64, 子目标稳定胜出, 不会污染 generic。
 echo ">>> 应用编译期特性片段 (kconfig 阶段)..."
+# 闸门 0: choice 完整性静态检查
+#   syncconfig 处于严格模式: 只要我们动过的 choice 还有成员没有取值(显示 NEW),
+#   内核构建就会停下来提问并在非交互环境下失败(run #20/#21 的真实原因)。
+#   这里对我们显式启用的两个 choice 做完整性断言, 把失败提前到编译之前。
+for chk in "TRANSPARENT_HUGEPAGE:TRANSPARENT_HUGEPAGE_ALWAYS TRANSPARENT_HUGEPAGE_MADVISE TRANSPARENT_HUGEPAGE_NEVER"; do
+    head_sym=${chk%%:*}; members=${chk#*:}
+    if grep -q "^CONFIG_${head_sym}=y" "$SUB_CONFIG"; then
+        for m in $members; do
+            grep -qE "^(CONFIG_${m}=y|# CONFIG_${m} is not set)$" "$SUB_CONFIG" \
+                || { echo "!!! choice 不完整: 已启用 ${head_sym} 但成员 ${m} 未显式取值"; \
+                     echo "    (syncconfig 会因此提问并在非交互环境下失败)"; exit 1; }
+        done
+    fi
+done
 bash "$SCRIPT_DIR/apply-features.sh" \
     --stage kconfig \
     --kconfig "$SUB_CONFIG" \
