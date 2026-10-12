@@ -92,6 +92,14 @@ if ! grep -q 'serial test vga echo loadenv' package/boot/grub2/Makefile; then
 fi
 echo "    OK: core.img / bootx64.efi 将内嵌 echo + loadenv (load_env + save_env)"
 
+# 同一道闸门也验证工具链内核配置补丁: 上游用 `yes '' | make oldconfig`,
+# 一旦出现【无默认值的 choice】就会因空行无法回答而报错退出(实测 run #20)。
+if ! grep -q 'olddefconfig' toolchain/kernel-headers/Makefile; then
+    echo "!!! 工具链内核配置补丁未生效 (交互式 oldconfig 会导致构建随机失败), 终止"
+    exit 1
+fi
+echo "    OK: 工具链内核配置改用 olddefconfig (完全非交互)"
+
 # ---------------------------------------------------------------------------
 # 1.5 注入宿主机自定义 rootfs 覆盖层 (files/)
 #

@@ -1,0 +1,11 @@
+--- a/toolchain/kernel-headers/Makefile
++++ b/toolchain/kernel-headers/Makefile
+@@ -94,7 +94,7 @@
+ endef
+ 
+ define Host/Configure
+-	yes '' | $(HOST_KMAKE) oldconfig
++	$(HOST_KMAKE) olddefconfig
+ 	$(call Host/Configure/all)
+ 	$(call Host/Configure/post/$(ARCH))
+ endef
