@@ -1,6 +1,26 @@
 # [新手指导](https://github.com/wukongdaily/AutoBuildImmortalWrt/wiki) 👈🏻
 # ImmortalWrt-ImageBuilder
 
+---
+
+## 🖥️ x86-64 宿主机专属固件（Inspur AliMoC-MD-02-25G）
+
+> 这一部分是**为特定硬件定制的【源码构建】固件**，与下面通用的 ImageBuilder 流程是**两套不同的东西**：
+> 源码构建才能改内核配置、打 grub2 补丁、内置自定义包与 A/B 升级工具链。
+
+| 文档 | 内容 |
+| --- | --- |
+| 📖 [固件总览](x86-64-host/README.md) | 这台机器是什么、固件包含什么、怎么构建、产物有哪些 |
+| 🚀 [**部署 / 安装 / 升级 / 回滚手册**](x86-64-host/INSTALL.md) | **A/B 双槽安装、日常升级、失败自动回滚、从 U 盘迁移到 SSD** |
+| 🧩 [平台专属优化清单](x86-64-host/PLATFORM.md) | 哪些优化专为这台机器而做（含实测证据与核验命令） |
+| 🔧 [编译期特性清单](x86-64-host/FEATURES.md) | 每一项开关、依据与验收标准 |
+| 🧪 [A/B 设计与演练记录](x86-64-host/ab/README.md) | 布局、回滚语义、KVM 演练结果、实验结论 |
+| 🛠 [特性片段机制](x86-64-host/features/README.md) | 如何新增一项编译期优化（可插拔、自校验） |
+
+构建入口：Actions → **Build 25.12.x x86-64 Host SOURCE (QAT enabled)**（手动触发；`features` 输入可临时开启可选片段）
+
+---
+
 **⚠️ 重要声明**
 
 > **本项目为个人独立维护的第三方项目(脚本)，与 ImmortalWrt 官方没有关联。** <br>
