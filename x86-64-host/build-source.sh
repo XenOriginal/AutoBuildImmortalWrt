@@ -19,6 +19,26 @@ set -euo pipefail
 # 编译期特性片段等相对路径一律以此为基准, 不依赖调用者的 cwd。
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
+# ---------------------------------------------------------------------------
+# 0. 构建变体 (BUILD_VARIANT)
+#   full  (默认): 宿主机专属固件 —— 含 A/B 工具链、rootfs 覆盖层、个性化服务
+#   clean (分发): 只保留【内核优化 + 软件包】, 不注入任何个性化脚本/服务,
+#                 也不打 A/B 专用补丁; 产出【标准分区布局】镜像,
+#                 可直接用常规 `sysupgrade -v <镜像>` 升级。
+#                 注: 内核调优(THP/HugeTLB/IOMMU/串口/加密/网络队列等)与
+#                     软件包(kmod/工具链)两者都保留 —— 它们不是"注入脚本"。
+# ---------------------------------------------------------------------------
+BUILD_VARIANT="${BUILD_VARIANT:-full}"
+case "$BUILD_VARIANT" in
+    full|clean) ;;
+    *) echo "!!! BUILD_VARIANT 只能是 full 或 clean (当前: $BUILD_VARIANT)"; exit 1 ;;
+esac
+INJECT_OVERLAY=1
+[ "$BUILD_VARIANT" = clean ] && INJECT_OVERLAY=0
+
+# 仅 A/B 布局需要的补丁; clean 变体不打(它用标准 sysupgrade 流程)
+AB_ONLY_PATCHES="0001-grub2-embed-loadenv-saveenv.patch"
+
 # GNU tar 等工具的 configure 会拒绝以 root 身份运行 (容器内是 root),
 # 必须显式跳过该检查, 否则 tools/tar 构建失败。
 export FORCE_UNSAFE_CONFIGURE=1
@@ -41,6 +61,7 @@ echo " 分支     : $REPO_BRANCH"
 echo " 固件大小 : ${PROFILE} MB"
 echo " Docker   : ${INCLUDE_DOCKER}"
 echo " 并发编译 : $(nproc) 线程"
+echo " 构建变体 : $BUILD_VARIANT  (clean = 仅内核优化+软件包, 不注入脚本, 标准 sysupgrade)"
 echo "============================================================"
 
 # ---------------------------------------------------------------------------
@@ -78,7 +99,13 @@ cd "$SRC_DIR"
 echo ">>> 应用源码补丁 (ab/patches)..."
 shopt -s nullglob
 for p in "$SCRIPT_DIR"/ab/patches/*.patch; do
-    echo "    补丁: $(basename "$p")"
+    _base=$(basename "$p")
+    if [ "$INJECT_OVERLAY" = 0 ]; then
+        case " $AB_ONLY_PATCHES " in
+            *" $_base "*) echo "    跳过(A/B 专用, clean 变体不需要): $_base"; continue ;;
+        esac
+    fi
+    echo "    补丁: $_base"
     if ! patch -p1 --dry-run < "$p" >/dev/null 2>&1; then
         echo "!!! 补丁无法应用 (上游可能已变更): $(basename "$p")"
         exit 1
@@ -86,7 +113,7 @@ for p in "$SCRIPT_DIR"/ab/patches/*.patch; do
     patch -p1 < "$p" >/dev/null
 done
 shopt -u nullglob
-if ! grep -q 'serial test vga echo loadenv' package/boot/grub2/Makefile; then
+if [ "$INJECT_OVERLAY" = 1 ] && ! grep -q 'serial test vga echo loadenv' package/boot/grub2/Makefile; then
     echo "!!! grub2 模块补丁未生效 —— A/B 自动回滚会失效, 终止"
     exit 1
 fi
@@ -122,6 +149,10 @@ echo "    OK: 工具链内核配置改用 olddefconfig (完全非交互)"
 #   对照: ImageBuilder 工作流 (build-x86-64-host.yml) 是正确写法 ——
 #         它把 files/ 直接挂到 /home/build/immortalwrt/files。
 # ---------------------------------------------------------------------------
+if [ "$INJECT_OVERLAY" = 0 ]; then
+  echo ">>> clean 变体: 跳过 rootfs 覆盖层与全部个性化服务注入"
+  echo "    (保留: 内核优化配置、软件包选择、QAT 包)"
+else
 echo ">>> 注入宿主机自定义 rootfs 覆盖层 (files/)..."
 if [ ! -d /host-files ]; then
     echo "!!! 未挂载 /host-files —— 宿主机调优文件无法注入, 终止"
@@ -201,6 +232,7 @@ ln -sf ../init.d/hw-tune "$SRC_DIR/files/etc/rc.d/S98hw-tune"
 ln -sf ../init.d/hw-mem  "$SRC_DIR/files/etc/rc.d/S94hw-mem"
 [ -e "$SRC_DIR/files/etc/init.d/hw-mem" ] || { echo "!!! hw-mem 安装失败"; exit 1; }
 echo "  OK: 运行期调优脚本已就位 (S94hw-mem / S98hw-tune)"
+fi   # INJECT_OVERLAY
 
 # ---------------------------------------------------------------------------
 # 2. 注入自定义 QAT 包
@@ -1032,6 +1064,7 @@ fi
 #   闸门 3 只能证明"包被安装了", 不能证明"files/ 覆盖层被 prepare_rootfs 应用"。
 #   这里直接在暂存 rootfs 里找文件本体; 若无暂存目录则降级为警告。
 # ---------------------------------------------------------------------------
+if [ "$INJECT_OVERLAY" = 1 ]; then
 echo ">>> 闸门 4: 断言宿主机覆盖层与 QAT 驱动文件已落在 rootfs 暂存区"
 ROOTFS_DIRS=$(find "$SRC_DIR/build_dir" -maxdepth 2 -type d \
     \( -name 'root-x86' -o -name 'root.orig-x86' \) 2>/dev/null || true)
@@ -1065,6 +1098,9 @@ if [ "$ROOTFS_SEEN" -eq 0 ]; then
 elif [ "$ROOTFS_OK" -eq 0 ]; then
     echo "!!! 覆盖层 / QAT 驱动未进入 rootfs —— 拒绝产出固件"
     exit 1
+fi
+else
+    echo ">>> 闸门 4: clean 变体无覆盖层, 跳过"
 fi
 
 # ---------------------------------------------------------------------------
