@@ -270,10 +270,12 @@ logread | grep -E 'hw-watchdog|hw-tune|hw-healthd|ab-bootok|hw-mem'
 | `ab-bootok` | 95 | A/B：健康检查通过后写 `boot_ok=1` |
 | `hw-watchdog` | 96 | 等 `boot_ok=1` 后 arm 硬件看门狗，每 5s 喂狗（挂死自动重启） |
 | `hw-healthd` | 97 | 每 15 min 巡检；每 24h 对 SSD 执行一次 `fstrim` |
+| `hw-storage-guard` | 98 | **存储自愈**（/Lager、/boot 挂载失败时预检/强制 fsck 后重挂）+ **dockerd 门控** |
 | `hw-tune` | 98 | 网卡级调优（转发 UDP GRO 等）与可选 CPU governor |
 | `hw-mem` | 94 | 按存储层级自适应内存/IO 策略（USB 保守 / SSD 放宽） |
 
 > ⚠️ 顺序不能改：喂狗必须在"启动成功标记"之后，否则新槽启动失败会被看门狗反复重启、掩盖回滚判定。
+> ⚠️ `hw-storage-guard` 与 `hw-tune` 同为 S98，按名字排序 guard 先跑；两者都早于 `dockerd`(S99)。
 
 ---
 
@@ -286,6 +288,8 @@ logread | grep -E 'hw-watchdog|hw-tune|hw-healthd|ab-bootok|hw-mem'
 | 起来是**空配置** | overlay 未迁移（用了 `--no-overlay`） | 重新用 `ab-upgrade`（不带 `--no-overlay`） |
 | 升级后网络不通 | 新槽配置与硬件不符 / 健康检查失败 | 等自动回滚；或进 failsafe 菜单修配置 |
 | 整机挂死无响应 | 内核/IO 卡死 | 看门狗在 ~20s 内自动重启；重启后 `logread` + `/etc/hw-watchdog.log` 查原因 |
+| **容器/镜像"好像全没了"** | `/Lager` 没挂上 → dockerd 退回 vfs | `hw-storage-guard status` 看挂载；按日志里的提示先修存储，再 `/etc/init.d/dockerd enable && start` |
+| 存储自愈失败标记 | `/etc/hw-storage-guard.FAILED` 存在 | 看 `/etc/hw-storage-guard.log`；必要时停服务后手工 `e2fsck -y <设备>` |
 | 想强制用旧槽 | — | BIOS 改回旧盘启动（最稳），或在 GRUB 菜单选 `slot A/B` |
 | 串口无输出 | 波特率不对 / HSUART 未接管 | 确认 **57600 8N1**；`dmesg \| grep 8250_mid` |
 | 中文文件名乱码 | 老固件 FAT 默认字符集 | 新固件已改 UTF-8；临时可 `mount -o iocharset=utf8` |

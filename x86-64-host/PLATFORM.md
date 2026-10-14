@@ -122,9 +122,32 @@
 | 6.1 | **硬件看门狗（iTCO）+ 用户态喂狗** | Denverton 有 iTCO 看门狗；本机历史上出现过整机挂死，只能断电 | `iTCO_wdt.ko` 在固件里但 `/dev/watchdog` 不存在、无喂狗服务 | `hw/hw-watchdog`（S96，等 `boot_ok=1` 才 arm） |
 | 6.2 | **温度/健康周期巡检** | 被动散热 SoC + 新 SSD，需要长期可观测 | coretemp 52–55°C（high 75/crit 95）、acpitz 26.8°C | `hw/hw-health` + `hw-healthd`（S97，15min） |
 | 6.3 | **启动序号约束 95/96/97/98** | A/B 的"启动成功标记"必须早于喂狗与巡检，否则会掩盖回滚判定 | 设计约束（本轮实测 `USE_PROCD` 坑后修复） | 各 init 脚本 `START=` |
-| 6.4 | **产物级闸门（2/5/6）** | 这台机器历史上出过"看着编译成功、实际没生效"的固件 | 闸门 5 断言 `expect_pkgs`；闸门 6 断言双启动镜像 | `build-source.sh` |
+| 6.4 | **产物级闸门（0/2/5/6）** | 这台机器历史上出过"看着编译成功、实际没生效"的固件 | 闸门 5 断言 `expect_pkgs`；闸门 6 断言双启动镜像 | `build-source.sh` |
+| 6.5 | **存储自愈 + dockerd 门控** | 本机无 UPS、频繁硬断电且系统跑在 U 盘上：2026-10-14 真实事故 = 掉电导致 `/Lager` ext4 journal 损坏 → 挂载失败 → dockerd 退回 vfs，**容器/镜像"看起来全丢了"** | dmesg: `JBD2: Invalid checksum … journal recovery failed` + `ext4_init_orphan_info: bad checksum`（掉电丢写签名） | `hw/hw-storage-guard`（S98）：自愈挂载 + 失败时**禁用 dockerd 自启**并留标记 |
 
 ---
+
+### 6.5 说明：为什么"门控 dockerd"比"自动修复"更关键
+
+自动修复（`e2fsck -p/-y`）治的是**存储**；而这次事故真正的危险在于**静默降级**：
+
+```
+/Lager 挂载失败
+  └─ dockerd 的 data-root=/Lager/docker 不存在
+       └─ docker 在只有 ~400MB 的根 overlayfs 上重建 data-root
+            └─ overlay2 不支持嵌套 overlay → 静默退回 vfs
+                 └─ 容器/镜像"全部消失"（数据其实完好，只是没挂上）
+```
+
+所以 `hw-storage-guard` 在自愈失败时会**主动禁用 dockerd 自启**并写
+`/etc/hw-storage-guard.FAILED` + syslog：
+宁可 docker 起不来（人能立刻看到），也不要它带着错误的 data-root 静默启动。
+恢复命令写在日志里：`/etc/init.d/dockerd enable && /etc/init.d/dockerd start`。
+
+**配套补齐**：固件现在带 `e2fsprogs` / `dosfstools` / **`f2fsck`**（此前只有 mkfs.f2fs，
+而根 overlay 正是 f2fs）——没有 fsck 工具，自愈脚本在无人到场时就是空转。
+
+**根治仍是迁移**：U 盘 + 频繁硬断电是物理根因；迁到内置 SATA SSD 并加小 UPS 才是终局。
 
 ## 七、通用基线（非平台专属，顺手补齐）
 

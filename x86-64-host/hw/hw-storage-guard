@@ -1,0 +1,183 @@
+#!/bin/sh /etc/rc.common
+# ============================================================================
+# 存储自愈守卫 + dockerd 门控 (防断电 / 防掉盘)
+#
+# 【为什么需要它 —— 来自一次真实事故 (2026-10-14)】
+#   本机长期无 UPS、频繁硬断电, 而系统跑在 U 盘上。事故链条:
+#       硬断电 -> sdb4(/Lager ext4) 掉电丢写
+#              -> journal 校验和损坏 + orphan file 校验和损坏
+#              -> 开机挂载 /Lager 失败(或只读无 journal)
+#              -> dockerd 的 data-root=/Lager/docker 不存在, docker 就在
+#                 只有 400MB 的根 overlayfs 上重建目录 -> overlay2 不支持嵌套
+#                 overlay -> 静默退回 vfs -> 容器/镜像"全部消失"
+#   实际上数据完好, 只是"看起来丢了", 且没有任何告警 —— 这才是最危险的地方。
+#
+# 【本脚本做两件事】
+#   1. 自愈: 对关键挂载点(/Lager, /boot)做"挂载检查 -> 安全预检(e2fsck -p /
+#      fsck.fat -a) -> 重挂 -> 必要时强制修复"; 发现只读挂载也会尝试修复后重挂。
+#   2. 门控: 若 /Lager 最终仍不可用, 则【禁用 dockerd 自启】并留下醒目标记 ——
+#      宁可 docker 不起来(人能看到), 也不要它带着错误的 data-root 静默启动、
+#      把"数据没挂上"伪装成"容器全丢了"。
+#
+# 【配置】/etc/hw-storage-guard.conf (可选):
+#   GUARD_TARGETS="/Lager|e2fsck,-p /boot|fsck.fat,-a"
+#   GUARD_FORCE=1          # 预检失败后允许 -y 强制修复 (默认 1)
+#   GUARD_GATE_DOCKER=1    # /Lager 不可用时禁用 dockerd 自启 (默认 1)
+#
+# 【手动使用】
+#   /etc/init.d/hw-storage-guard status     # 看挂载/自愈/dockerd 门控状态
+#   /etc/init.d/hw-storage-guard start      # 立即跑一次自愈
+#   日志: /etc/hw-storage-guard.log + logread -e hw-storage-guard
+#
+# 【修复后恢复 docker】
+#   /etc/init.d/dockerd enable && /etc/init.d/dockerd start
+# ============================================================================
+
+START=98
+STOP=02
+
+LOG=/etc/hw-storage-guard.log
+MARK=/etc/hw-storage-guard.FAILED
+CONF=/etc/hw-storage-guard.conf
+
+GUARD_TARGETS=${GUARD_TARGETS:-"/Lager|e2fsck,-p /boot|fsck.fat,-a"}
+GUARD_FORCE=${GUARD_FORCE:-1}
+GUARD_GATE_DOCKER=${GUARD_GATE_DOCKER:-1}
+
+log() { logger -t hw-storage-guard "$1"; echo "$(date '+%F %T') $1" >> "$LOG"; }
+
+mounted() { awk -v m="$1" '$2==m{found=1} END{exit !found}' /proc/mounts; }
+mounted_rw() {
+    awk -v m="$1" '$2==m && $4 !~ /(^|,)ro(,|$)/ {ok=1} END{exit !ok}' /proc/mounts
+}
+
+# 由 uci fstab + block info 解析挂载点对应的设备 (不写死设备名, 迁移后仍正确)
+dev_of() { # $1=mountpoint
+    local sect uuid lab d
+    sect=$(uci -q show fstab 2>/dev/null | awk -F. -v t="$1" '$0 ~ "target=."t"." {print $2; exit}')
+    [ -n "${sect:-}" ] || return 1
+    uuid=$(uci -q get "fstab.$sect.uuid" 2>/dev/null)
+    if [ -n "${uuid:-}" ]; then
+        block info 2>/dev/null | grep -i "$uuid" | cut -d: -f1 | head -1
+        return 0
+    fi
+    lab=$(uci -q get "fstab.$sect.label" 2>/dev/null)
+    if [ -n "${lab:-}" ]; then
+        block info 2>/dev/null | grep -i "LABEL=\"$lab\"" | cut -d: -f1 | head -1
+        return 0
+    fi
+    d=$(uci -q get "fstab.$sect.device" 2>/dev/null)
+    [ -n "${d:-}" ] && { echo "$d"; return 0; }
+    return 1
+}
+
+# $1=命令(逗号分隔, 如 "e2fsck,-p") $2=dev $3=force(0/1)
+fsck_by_name() {
+    local cmd=$1 dev=$2 force=$3 exe args
+    exe=$(echo "$cmd" | cut -d, -f1)
+    args=$(echo "$cmd" | cut -d, -f2- | tr ',' ' ')
+    case "$exe" in
+        e2fsck)    [ "$force" = 1 ] && e2fsck -y "$dev" >>"$LOG" 2>&1 \
+                                    || e2fsck $args "$dev" >>"$LOG" 2>&1 ;;
+        fsck.fat)  fsck.fat -a "$dev" >>"$LOG" 2>&1 ;;
+        fsck.f2fs) fsck.f2fs -a "$dev" >>"$LOG" 2>&1 ;;
+        *) return 1 ;;
+    esac
+}
+
+ensure_mount() { # $1=mountpoint $2=fsck 预检命令
+    local mp=$1 fsckp=$2 dev
+    if mounted "$mp"; then
+        if mounted_rw "$mp"; then
+            log "$mp 已可读写挂载, 跳过"
+            return 0
+        fi
+        log "!! $mp 处于【只读】挂载 —— 尝试修复后重挂"
+        umount "$mp" 2>/dev/null
+    fi
+
+    dev=$(dev_of "$mp")
+    if [ -z "${dev:-}" ]; then
+        log "!! $mp: 无法从 fstab 解析设备"
+        return 1
+    fi
+
+    log "$mp 未挂载 (设备 $dev) -> 先尝试直接挂载"
+    mkdir -p "$mp"
+    if mount "$dev" "$mp" 2>/dev/null; then
+        log "  ✅ 直接挂载成功"
+        return 0
+    fi
+
+    log "  直接挂载失败 -> 安全预检: $(echo "$fsckp" | tr ',' ' ') $dev"
+    fsck_by_name "$fsckp" "$dev" 0
+    if mount "$dev" "$mp" 2>/dev/null; then
+        log "  ✅ 预检修复后挂载成功"
+        return 0
+    fi
+
+    if [ "$GUARD_FORCE" = 1 ]; then
+        log "  仍失败 -> 强制修复(可能较慢): $(echo "$fsckp" | cut -d, -f1) -y $dev"
+        fsck_by_name "$fsckp" "$dev" 1
+        if mount "$dev" "$mp" 2>/dev/null; then
+            log "  ✅ 强制修复后挂载成功"
+            return 0
+        fi
+    fi
+
+    log "  ❌ $mp 仍然无法挂载 (详见 $LOG)"
+    return 1
+}
+
+gate_docker() {
+    [ "$GUARD_GATE_DOCKER" = 1 ] || return 0
+    mounted_rw /Lager && return 0
+    [ -x /etc/init.d/dockerd ] || return 0
+    if /etc/init.d/dockerd enabled 2>/dev/null; then
+        /etc/init.d/dockerd stop 2>/dev/null
+        /etc/init.d/dockerd disable 2>/dev/null
+        log "!!! /Lager 不可用 -> 已禁用 dockerd 自启"
+        log "    原因: 否则 docker 会在根分区上重建 data-root(仅 400MB 可用),"
+        log "          overlay2 嵌套失败后静默退回 vfs, 表现为'容器/镜像全丢了'。"
+        log "    修复后: /etc/init.d/dockerd enable && /etc/init.d/dockerd start"
+        touch "$MARK"
+    else
+        log "!! /Lager 不可用, 且 dockerd 自启已处于禁用状态(无需处理)"
+        touch "$MARK"
+    fi
+}
+
+start() {
+    [ -f "$CONF" ] && . "$CONF"
+    log "=== 存储自愈开始 (目标: $GUARD_TARGETS) ==="
+    local fail=0
+    for t in $GUARD_TARGETS; do
+        ensure_mount "${t%%|*}" "${t#*|}" || fail=1
+    done
+    gate_docker
+    if [ "$fail" = 0 ]; then
+        rm -f "$MARK"
+        log "=== 自愈完成: 全部挂载点正常 ==="
+    else
+        log "=== 自愈完成: 存在失败项 (见 $MARK) ==="
+    fi
+    return 0
+}
+
+stop() { :; }
+
+status() {
+    local t
+    for t in $GUARD_TARGETS; do
+        printf "%-20s %s\n" "${t%%|*}" "$(mounted "${t%%|*}" && (mounted_rw "${t%%|*}" && echo "已挂载(读写)" || echo "已挂载(只读!)") || echo 未挂载)"
+    done
+    [ -f "$MARK" ] && echo "自愈状态: 上次有失败 ($MARK)" || echo "自愈状态: 正常"
+    if [ -x /etc/init.d/dockerd ]; then
+        /etc/init.d/dockerd enabled 2>/dev/null && echo "dockerd 自启: 已启用" || echo "dockerd 自启: 已禁用(可能被门控)"
+    fi
+    echo "最近日志:"
+    tail -8 "$LOG" 2>/dev/null | sed 's/^/  /'
+}
+
+EXTRA_COMMANDS="status"
+EXTRA_HELP="        status  查看挂载/自愈/dockerd 门控状态"
