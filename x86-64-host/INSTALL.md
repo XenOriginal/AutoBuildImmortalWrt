@@ -279,6 +279,32 @@ logread | grep -E 'hw-watchdog|hw-tune|hw-healthd|ab-bootok|hw-mem'
 
 ---
 
+## 6.5 现网部署记录：存储守卫统一（2026-10-14）
+
+设备 `10.0.0.1` 上曾同时存在两套断电自愈脚本（本仓库的 `hw-storage-guard`
+与另一方的 `lager-guard`，同为 S98）。已**统一为一套**并验证：
+
+| 项 | 状态 |
+| --- | --- |
+| 生效脚本 | `/etc/init.d/hw-storage-guard` + `/etc/rc.d/S98hw-storage-guard`（唯一） |
+| 另一方 | 文件保留为 `/etc/init.d/lager-guard.disabled-by-hw-storage-guard`，rc.d 链接已移除 |
+| 备份目录 | `/root/storage-guard-unify-20261014-2313/`（lager-guard、.v1.bak、fstab、rc.d 清单） |
+| 一致性 | 设备上脚本 md5 = 仓库版本 md5（同一份文件随固件发布） |
+| 验证 | DRY-RUN 演练 ✓；真实路径实跑：`/boot` 卸载→`fsck.fat -a`（无需修复）→挂回，挂载参数不变 ✓；`/Lager` 健康不动 ✓；dockerd 未被误门控，17 容器无恙 ✓ |
+
+**统一版吸收了两边的实践**：设备按 `uci fstab`+`block info` 解析（不写死 `/dev/sdbX`，
+迁移到 SSD 后仍正确）、只读挂载识别与 `remount,rw` 尝试、fsck 前卸载**所有叠加挂载**
+（如 `/Lager/docker`）、每次开机对 `/boot` 做主动 fsck（vfat 无日志且 dirty bit 不可判）、
+**dockerd 门控**、`status` 子命令、`GUARD_DRY_RUN` 演练、沿用 fstab 挂载参数。
+
+**回滚（如需退回另一方）**：
+
+```sh
+mv /etc/init.d/lager-guard.disabled-by-hw-storage-guard /etc/init.d/lager-guard
+ln -sf ../init.d/lager-guard /etc/rc.d/S98lager-guard
+rm -f /etc/rc.d/S98hw-storage-guard
+```
+
 ## 7. 故障速查
 
 | 现象 | 可能原因 | 处置 |

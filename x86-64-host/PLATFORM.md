@@ -144,6 +144,10 @@
 宁可 docker 起不来（人能立刻看到），也不要它带着错误的 data-root 静默启动。
 恢复命令写在日志里：`/etc/init.d/dockerd enable && /etc/init.d/dockerd start`。
 
+**现网已统一为一套**（2026-10-14）：设备上原本并存两套 S98 自愈脚本，现统一为
+`hw-storage-guard`（吸收另一方对 `/boot` 主动 fsck 与叠加挂载卸载的做法），
+另一方文件保留但已停用；设备脚本与仓库版本 md5 一致。详见 `INSTALL.md` 6.5。
+
 **配套补齐**：固件现在带 `e2fsprogs` / `dosfstools` / **`f2fsck`**（此前只有 mkfs.f2fs，
 而根 overlay 正是 f2fs）——没有 fsck 工具，自愈脚本在无人到场时就是空转。
 
