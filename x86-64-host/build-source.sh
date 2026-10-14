@@ -20,7 +20,12 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # ---------------------------------------------------------------------------
-# 0. 构建变体 (BUILD_VARIANT)
+# 0. 构建变体 (FW_VARIANT)
+#
+# 【命名注意 —— 实测踩过】不要叫 BUILD_VARIANT: 那是 OpenWrt 构建系统自己
+# 使用的变量(用于包的变体选择)。把它导出到构建环境后, 所有包都会被当成
+# 该变体去构建, 例如 iproute2 会因变体不存在而 configure 失败、构建中断
+# (run #23 的真实失败原因)。因此固件变体必须用一个不冲突的名字。
 #   full  (默认): 宿主机专属固件 —— 含 A/B 工具链、rootfs 覆盖层、个性化服务
 #   clean (分发): 只保留【内核优化 + 软件包】, 不注入任何个性化脚本/服务,
 #                 也不打 A/B 专用补丁; 产出【标准分区布局】镜像,
@@ -28,13 +33,13 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 #                 注: 内核调优(THP/HugeTLB/IOMMU/串口/加密/网络队列等)与
 #                     软件包(kmod/工具链)两者都保留 —— 它们不是"注入脚本"。
 # ---------------------------------------------------------------------------
-BUILD_VARIANT="${BUILD_VARIANT:-full}"
-case "$BUILD_VARIANT" in
+FW_VARIANT="${FW_VARIANT:-full}"
+case "$FW_VARIANT" in
     full|clean) ;;
-    *) echo "!!! BUILD_VARIANT 只能是 full 或 clean (当前: $BUILD_VARIANT)"; exit 1 ;;
+    *) echo "!!! FW_VARIANT 只能是 full 或 clean (当前: $FW_VARIANT)"; exit 1 ;;
 esac
 INJECT_OVERLAY=1
-[ "$BUILD_VARIANT" = clean ] && INJECT_OVERLAY=0
+[ "$FW_VARIANT" = clean ] && INJECT_OVERLAY=0
 
 # 仅 A/B 布局需要的补丁; clean 变体不打(它用标准 sysupgrade 流程)
 AB_ONLY_PATCHES="0001-grub2-embed-loadenv-saveenv.patch"
@@ -46,6 +51,9 @@ export FORCE_UNSAFE_CONFIGURE=1
 SRC_DIR="/work/immortalwrt"
 REPO_URL="https://github.com/immortalwrt/immortalwrt.git"
 REPO_BRANCH="${IMM_BRANCH:-openwrt-25.12}"
+# 【可选】固定到指定提交(推荐用于分发版): 分支 tip 会随时移动, 上游包偶发回归
+# (实测: iproute2 6.18.0 的 configure 在 snapshot tip 上失败) -> 固定提交可复现。
+IMM_COMMIT="${IMM_COMMIT:-}"
 LOG="$SRC_DIR/build-host.log"
 
 # 为 set -u 提供默认值, 避免未传入时直接终止
@@ -61,7 +69,7 @@ echo " 分支     : $REPO_BRANCH"
 echo " 固件大小 : ${PROFILE} MB"
 echo " Docker   : ${INCLUDE_DOCKER}"
 echo " 并发编译 : $(nproc) 线程"
-echo " 构建变体 : $BUILD_VARIANT  (clean = 仅内核优化+软件包, 不注入脚本, 标准 sysupgrade)"
+echo " 构建变体 : $FW_VARIANT  (clean = 仅内核优化+软件包, 不注入脚本, 标准 sysupgrade)"
 echo "============================================================"
 
 # ---------------------------------------------------------------------------
@@ -72,6 +80,14 @@ if [ ! -d "$SRC_DIR/.git" ]; then
     git clone --depth=1 -b "$REPO_BRANCH" "$REPO_URL" "$SRC_DIR"
 else
     echo ">>> 源码目录已存在, 复用"
+fi
+if [ -n "$IMM_COMMIT" ]; then
+    echo ">>> 固定到指定提交: $IMM_COMMIT"
+    ( cd "$SRC_DIR" && git fetch --depth=1 origin "$IMM_COMMIT" && git checkout -q FETCH_HEAD ) \
+        || { echo "!!! 无法检出指定提交: $IMM_COMMIT"; exit 1; }
+    echo "    当前源码提交: $(cd "$SRC_DIR" && git rev-parse --short HEAD) ($(cd "$SRC_DIR" && git log -1 --format=%cs))"
+else
+    echo "    源码提交(分支 tip): $(cd "$SRC_DIR" && git rev-parse --short HEAD) ($(cd "$SRC_DIR" && git log -1 --format=%cs))"
 fi
 cd "$SRC_DIR"
 
