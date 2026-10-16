@@ -18,6 +18,12 @@ name: Build 25.12.x x86-64 Host SOURCE (QAT enabled)
 #   - dirty_writeback 限制 + swappiness=150 (配合 zram)
 # ============================================================================
 on:
+  push:
+    branches:
+      - feat/compile-stage-features
+    paths:
+      - 'x86-64-host/**'
+      - '.github/workflows/build-x86-64-host-source.yml'
   workflow_dispatch:
     inputs:
       imm_branch:
@@ -122,8 +128,8 @@ jobs:
         run: |
           set -e
           mkdir -p /mnt/build
-          echo "${{ github.event.inputs.custom_router_ip }}" > custom_router_ip.txt
-          echo "管理地址: ${{ github.event.inputs.custom_router_ip }}"
+          echo "${{ inputs.custom_router_ip || '10.0.0.1' }}" > custom_router_ip.txt
+          echo "管理地址: ${{ inputs.custom_router_ip || '10.0.0.1' }}"
 
           # uci-defaults (首次启动脚本)
           mkdir -p files/etc/uci-defaults
@@ -156,15 +162,15 @@ jobs:
 
       - name: Build firmware from source (with QAT)
         env:
-          IMM_BRANCH: ${{ github.event.inputs.imm_branch }}
-          IMM_COMMIT: ${{ github.event.inputs.imm_commit }}
-          PROFILE: ${{ github.event.inputs.profile }}
-          INCLUDE_DOCKER: ${{ github.event.inputs.include_docker }}
-          ENABLE_PPPOE: ${{ inputs.enable_pppoe }}
-          PPPOE_ACCOUNT: ${{ inputs.pppoe_account }}
-          PPPOE_PASSWORD: ${{ inputs.pppoe_password }}
-          FEATURES: ${{ github.event.inputs.features }}
-          FW_VARIANT: ${{ github.event.inputs.variant }}
+          IMM_BRANCH: ${{ inputs.imm_branch || 'openwrt-25.12' }}
+          IMM_COMMIT: ${{ inputs.imm_commit || '' }}
+          PROFILE: ${{ inputs.profile || '1024' }}
+          INCLUDE_DOCKER: ${{ inputs.include_docker || 'yes' }}
+          ENABLE_PPPOE: ${{ inputs.enable_pppoe || 'no' }}
+          PPPOE_ACCOUNT: ${{ inputs.pppoe_account || '' }}
+          PPPOE_PASSWORD: ${{ inputs.pppoe_password || '' }}
+          FEATURES: ${{ inputs.features || '' }}
+          FW_VARIANT: ${{ inputs.variant || 'clean-ab' }}
         run: |
           set -e
           chmod +x x86-64-host/build-source.sh
@@ -225,7 +231,7 @@ jobs:
           # ------------------------------------------------------------------
           echo
           echo "=== QAT 是否在固件清单 (.manifest) 内 ==="
-          MANIFEST=$(ls -1 bin/targets/x86/64/*-"${{ github.event.inputs.profile }}".manifest 2>/dev/null | head -1)
+          MANIFEST=$(ls -1 bin/targets/x86/64/*-"${{ inputs.profile || '1024' }}".manifest 2>/dev/null | head -1)
           [ -n "$MANIFEST" ] || MANIFEST=$(ls -1 bin/targets/x86/64/*.manifest 2>/dev/null | head -1)
           if [ -z "$MANIFEST" ]; then
             echo "::error::未找到 .manifest, 无法证明 QAT 已安装"
@@ -274,7 +280,7 @@ jobs:
       - name: Upload firmware
         uses: actions/upload-artifact@v4
         with:
-          name: ImmortalWrt-x86-64-Host-QAT-source${{ github.event.inputs.variant == 'clean' && '-clean' || (github.event.inputs.variant == 'clean-ab' && '-clean-ab' || '') }}
+          name: ImmortalWrt-x86-64-Host-QAT-source${{ (inputs.variant == 'clean' && '-clean') || (inputs.variant == 'full' && '') || '-clean-ab' }}
           path: |
             bin/targets/x86/64/*.img.gz
             bin/targets/x86/64/*.squashfs-combined*
