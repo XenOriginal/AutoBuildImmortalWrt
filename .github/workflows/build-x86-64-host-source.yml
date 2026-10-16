@@ -67,11 +67,12 @@ on:
         required: false
         default: ''
       variant:
-        description: "构建变体: full=宿主机专属(含 A/B 工具链与注入服务) / clean=纯净分发版(仅内核优化+软件包, 标准 sysupgrade)"
+        description: "构建变体: clean-ab=纯净A/B版(推荐, 仅A/B+防掉电拓扑, 剥离额外脚本) / full=全量宿主专属 / clean=纯净非A/B版"
         required: true
-        default: 'full'
+        default: 'clean-ab'
         type: choice
         options:
+          - clean-ab
           - full
           - clean
 
@@ -273,7 +274,7 @@ jobs:
       - name: Upload firmware
         uses: actions/upload-artifact@v4
         with:
-          name: ImmortalWrt-x86-64-Host-QAT-source${{ github.event.inputs.variant == 'clean' && '-clean' || '' }}
+          name: ImmortalWrt-x86-64-Host-QAT-source${{ github.event.inputs.variant == 'clean' && '-clean' || (github.event.inputs.variant == 'clean-ab' && '-clean-ab' || '') }}
           path: |
             bin/targets/x86/64/*.img.gz
             bin/targets/x86/64/*.squashfs-combined*

@@ -31,29 +31,24 @@
 
 编译期清单（每一项的开关与依据）见 **[`FEATURES.md`](FEATURES.md)**；A/B 设计与演练记录见 **[`ab/README.md`](ab/README.md)**。
 
-## 二·五、两个构建变体：`full` / `clean`
+## 二·五、三个构建变体：`clean-ab` / `full` / `clean`
 
-同一份源码 + 同一套特性片段，可产出两种用途不同的固件：
+同一份源码 + 同一套特性片段，可按需产出三种不同定位的固件：
 
-| | **full（宿主机专属）** | **clean（纯净分发版）** |
-| --- | --- | --- |
-| 内核优化 | ✅ 全部特性片段（KVM/VT-d/微码/加密/看门狗/THP+HugeTLB/网络队列/文件系统…） | ✅ **完全相同** |
-| 软件包 | ✅ 驱动 + 工具 + QAT | ✅ **完全相同** |
-| 串口控制台等平台适配 | ✅ | ✅（属内核/GRUB 配置） |
-| rootfs 覆盖层（自定义 `sysctl.conf`/`uci-defaults`/`modules.d`） | ✅ 注入 | ❌ 不注入 |
-| A/B 工具链与服务（`ab-*`、`hw-*`、看门狗/巡检） | ✅ | ❌ 不安装 |
-| grub2 `loadenv` 补丁（A/B 专用） | ✅ | ❌ 不打（其余补丁照打） |
-| 分区布局 | A/B 双槽（`ab-layout.sh` 铺设） | **标准两分区** |
-| 升级方式 | **只能用 `ab-upgrade`** | **常规 `sysupgrade -v <镜像>`** |
-| 产物名 | `ImmortalWrt-x86-64-Host-QAT-source` | `ImmortalWrt-x86-64-Host-QAT-source-clean` |
+| 维度 | **clean-ab（推荐·纯净A/B版）** | **full（宿主机全量版）** | **clean（纯净非A/B版）** |
+| --- | --- | --- | --- |
+| 内核优化 | ✅ 全部特性（KVM/VT-d/微码/加密/THP+HugeTLB/文件系统/efivar…） | ✅ **完全相同** | ✅ **完全相同** |
+| 软件包 | ✅ 驱动 + 工具 + QAT + efivar | ✅ **完全相同** | ✅ **完全相同** |
+| A/B 补丁与工具 | ✅ **完整集成**（grub2 loadenv + ab 工具链 + Web 升级） | ✅ **完整集成** | ❌ 不集成 |
+| 硬盘防掉电拓扑 | ✅ **完整加固**（sysctl 64MB 脏页限制 + /boot ro + 存储门控） | ✅ 完整加固 | ❌ 原生默认 |
+| 额外个性化注入脚本 | ❌ **彻底剥离**（无 hw-watchdog, hw-healthd, hw-tune, hw-mem 等） | ✅ 注入全量脚本 | ❌ 不注入 |
+| 分区布局 | **A/B 双槽**（SSD 物理双槽） | **A/B 双槽** | **标准两分区** |
+| 升级方式 | **Web 升级 / `ab-upgrade`**（sysupgrade 自动转接防护） | **Web 升级 / `ab-upgrade`** | **常规 `sysupgrade -v`** |
+| 产物名 | `ImmortalWrt-x86-64-Host-QAT-source-clean-ab` | `ImmortalWrt-x86-64-Host-QAT-source` | `ImmortalWrt-x86-64-Host-QAT-source-clean` |
 
-**怎么构建**：Actions → *Build 25.12.x x86-64 Host SOURCE (QAT enabled)* → 手动触发，`variant` 选 `full` 或 `clean`（默认 full）。
+**clean-ab 的定位**：专为本机全新 SSD 迁移打造的**纯净高可用基线**。它兼备 A/B 双槽防变砖与防掉电文件系统拓扑加固，但排除了所有常驻的侵入式脚本与机型私货，先把底层系统做好，等正式稳定运行后再按需引入 agent 扩展。
 
-**clean 的定位**：给同型号机器/他人测试分发的"干净基线"——只有内核调优与软件包，
-没有本机专属的自动化脚本；用它 `sysupgrade` 升级不会碰 A/B 布局相关的东西。
-
-> ⚠️ 两者不要混用：clean 镜像**不能**用 `ab-upgrade` 写入 A/B 槽（它没有 A/B 引导逻辑），
-> 也不要对 full 系统执行 `sysupgrade`（分区布局不同）。
+**怎么构建**：Actions → *Build 25.12.x x86-64 Host SOURCE (QAT enabled)* → 手动触发，`variant` 选 `clean-ab`（默认推荐）。
 
 ---
 

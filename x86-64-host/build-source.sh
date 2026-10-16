@@ -26,17 +26,22 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # 使用的变量(用于包的变体选择)。把它导出到构建环境后, 所有包都会被当成
 # 该变体去构建, 例如 iproute2 会因变体不存在而 configure 失败、构建中断
 # (run #23 的真实失败原因)。因此固件变体必须用一个不冲突的名字。
-#   full  (默认): 宿主机专属固件 —— 含 A/B 工具链、rootfs 覆盖层、个性化服务
-#   clean (分发): 只保留【内核优化 + 软件包】, 不注入任何个性化脚本/服务,
-#                 也不打 A/B 专用补丁; 产出【标准分区布局】镜像,
-#                 可直接用常规 `sysupgrade -v <镜像>` 升级。
-#                 注: 内核调优(THP/HugeTLB/IOMMU/串口/加密/网络队列等)与
-#                     软件包(kmod/工具链)两者都保留 —— 它们不是"注入脚本"。
+#   clean-ab (推荐·纯净A/B版):
+#                 适用于 A/B 双槽布局的纯净固件。包含完整的内核级调优
+#                 (KVM/VT-d/微码/加密/大页/文件系统工具) + A/B 双槽基础设施
+#                 (GRUB loadenv 补丁 + ab 工具链 + sysupgrade 守护 + LuCI Web 升级界面)
+#                 + 硬盘防掉电拓扑配置 (sysctl 脏页绝对字节上限 64MB + /boot 常态只读 +
+#                 /Lager 掉电安全挂载与存储门控)。
+#                 【完全剥离】所有额外的个性化侵入式脚本 (hw-watchdog, hw-healthd,
+#                 hw-tune, hw-mem, host-zram, 99-host.sh, hsuart 脚本等),
+#                 先把系统底层环境做到绝对纯净, 等正式运行后再按需引入 agent 扩展。
+#   full         : 宿主机专属全量固件 —— 含全量额外调优脚本与机型专属绑定服务。
+#   clean (分发) : 仅内核优化+软件包, 不打 A/B 补丁, 标准双分区, 常规 sysupgrade。
 # ---------------------------------------------------------------------------
-FW_VARIANT="${FW_VARIANT:-full}"
+FW_VARIANT="${FW_VARIANT:-clean-ab}"
 case "$FW_VARIANT" in
-    full|clean) ;;
-    *) echo "!!! FW_VARIANT 只能是 full 或 clean (当前: $FW_VARIANT)"; exit 1 ;;
+    clean-ab|full|clean) ;;
+    *) echo "!!! FW_VARIANT 只能是 clean-ab, full 或 clean (当前: $FW_VARIANT)"; exit 1 ;;
 esac
 INJECT_OVERLAY=1
 [ "$FW_VARIANT" = clean ] && INJECT_OVERLAY=0
@@ -165,24 +170,66 @@ echo "    OK: 工具链内核配置改用 olddefconfig (完全非交互)"
 #   对照: ImageBuilder 工作流 (build-x86-64-host.yml) 是正确写法 ——
 #         它把 files/ 直接挂到 /home/build/immortalwrt/files。
 # ---------------------------------------------------------------------------
-if [ "$INJECT_OVERLAY" = 0 ]; then
-  echo ">>> clean 变体: 跳过 rootfs 覆盖层与全部个性化服务注入"
+if [ "$FW_VARIANT" = clean ]; then
+  echo ">>> clean 变体: 跳过 rootfs 覆盖层与全部个性化服务注入 (标准两分区镜像)"
   echo "    (保留: 内核优化配置、软件包选择、QAT 包)"
+elif [ "$FW_VARIANT" = clean-ab ]; then
+  echo ">>> clean-ab 变体: 纯净 A/B 分区固件 (A/B 双槽基础设施 + 硬盘防掉电拓扑配置, 统一取消额外注入脚本)..."
+  mkdir -p "$SRC_DIR/files/etc" \
+           "$SRC_DIR/files/etc/uci-defaults" \
+           "$SRC_DIR/files/usr/sbin" "$SRC_DIR/files/usr/lib" \
+           "$SRC_DIR/files/etc/init.d" "$SRC_DIR/files/etc/rc.d" \
+           "$SRC_DIR/files/usr/libexec/rpcd" "$SRC_DIR/files/usr/share/rpcd/acl.d" \
+           "$SRC_DIR/files/www/luci-static/resources/view/system"
+
+  # 1. 注入防掉电核心配置 (锁定脏页绝对字节上限 64MB / 32MB, 5秒过期)
+  if [ -f /host-files/etc/sysctl.conf ]; then
+      cp /host-files/etc/sysctl.conf "$SRC_DIR/files/etc/sysctl.conf"
+  elif [ -f "$SCRIPT_DIR/../host-files/etc/sysctl.conf" ]; then
+      cp "$SCRIPT_DIR/../host-files/etc/sysctl.conf" "$SRC_DIR/files/etc/sysctl.conf"
+  fi
+
+  # 2. 注入首启防掉电存储拓扑配置 (/boot 挂载 ro, /Lager 挂载 barrier=1,commit=5)
+  install -m 0755 "$SCRIPT_DIR/ab/10-ab-clean-storage.sh" "$SRC_DIR/files/etc/uci-defaults/10-ab-clean-storage.sh"
+
+  # 3. 注入 A/B 基础设施与 Web 升级界面
+  install -m 0755 "$SCRIPT_DIR/ab/ab-upgrade" "$SRC_DIR/files/usr/sbin/ab-upgrade"
+  install -m 0755 "$SCRIPT_DIR/ab/ab-status"  "$SRC_DIR/files/usr/sbin/ab-status"
+  install -m 0755 "$SCRIPT_DIR/ab/ab-switch"  "$SRC_DIR/files/usr/sbin/ab-switch"
+  install -m 0755 "$SCRIPT_DIR/ab/sysupgrade-wrapper" "$SRC_DIR/files/usr/sbin/sysupgrade"
+  install -m 0644 "$SCRIPT_DIR/ab/ab-lib.sh"  "$SRC_DIR/files/usr/lib/ab-lib.sh"
+  install -m 0755 "$SCRIPT_DIR/ab/ab-bootok"  "$SRC_DIR/files/etc/init.d/ab-bootok"
+  ln -sf ../init.d/ab-bootok "$SRC_DIR/files/etc/rc.d/S95ab-bootok"
+
+  install -m 0755 "$SCRIPT_DIR/luci/luci.ab" "$SRC_DIR/files/usr/libexec/rpcd/luci.ab"
+  install -m 0644 "$SCRIPT_DIR/luci/luci-app-ab-upgrade.json" "$SRC_DIR/files/usr/share/rpcd/acl.d/luci-app-ab-upgrade.json"
+  install -m 0644 "$SCRIPT_DIR/luci/flash.js" "$SRC_DIR/files/www/luci-static/resources/view/system/flash.js"
+
+  # 4. 注入基础存储门控守卫 (防止掉盘后静默在根上建立假目录)
+  install -m 0755 "$SCRIPT_DIR/hw/hw-storage-guard" "$SRC_DIR/files/etc/init.d/hw-storage-guard"
+  ln -sf ../init.d/hw-storage-guard "$SRC_DIR/files/etc/rc.d/S98hw-storage-guard"
+
+  for f in usr/sbin/ab-upgrade usr/sbin/ab-status usr/sbin/ab-switch usr/sbin/sysupgrade \
+           usr/lib/ab-lib.sh etc/init.d/ab-bootok etc/rc.d/S95ab-bootok \
+           usr/libexec/rpcd/luci.ab usr/share/rpcd/acl.d/luci-app-ab-upgrade.json \
+           www/luci-static/resources/view/system/flash.js \
+           etc/sysctl.conf etc/uci-defaults/10-ab-clean-storage.sh etc/init.d/hw-storage-guard; do
+      [ -e "$SRC_DIR/files/$f" ] || { echo "!!! clean-ab 关键基础设施安装失败: $f"; exit 1; }
+  done
+  echo "  OK: clean-ab 纯净 A/B 基础设施与防掉电配置就位 (已彻底剥离所有额外非核心脚本)"
 else
-echo ">>> 注入宿主机自定义 rootfs 覆盖层 (files/)..."
+echo ">>> full 变体: 注入宿主机全量自定义 rootfs 覆盖层 (files/)..."
 if [ ! -d /host-files ]; then
     echo "!!! 未挂载 /host-files —— 宿主机调优文件无法注入, 终止"
     exit 1
 fi
 mkdir -p "$SRC_DIR/files"
 cp -a /host-files/. "$SRC_DIR/files/"
-# git 在 core.fileMode=false 的检出下会丢可执行位, 这里兜一层
 chmod +x "$SRC_DIR"/files/etc/init.d/* 2>/dev/null || true
 chmod +x "$SRC_DIR"/files/etc/uci-defaults/* 2>/dev/null || true
 echo "--- $SRC_DIR/files 内容 ---"
 find "$SRC_DIR/files" -mindepth 1 | sort
 
-# 硬断言: 关键文件缺一不可, 否则立刻失败 —— 宁可不编译, 也不出残缺固件
 for must in \
     files/etc/sysctl.conf \
     files/etc/modules.d/30-tcp-bbr \
@@ -199,14 +246,6 @@ for must in \
 done
 echo "  OK: 覆盖层已注入并通过完整性断言"
 
-# ---------------------------------------------------------------------------
-# 1.6 安装 A/B 工具到 rootfs 覆盖层
-#
-#   设备侧工具的唯一真源在仓库 x86-64-host/ab/ 下, 构建时安装进镜像,
-#   避免"仓库里一份、镜像里另一份"的漂移。
-#   注意 rc.d 符号链接必须显式创建: 仅把脚本放进 /etc/init.d 不会开机自启。
-# ---------------------------------------------------------------------------
-echo ">>> 安装 A/B 工具 (ab-upgrade / ab-status / ab-switch / ab-bootok / sysupgrade-wrapper)..."
 install -d "$SRC_DIR/files/usr/sbin" "$SRC_DIR/files/usr/lib" \
            "$SRC_DIR/files/etc/init.d" "$SRC_DIR/files/etc/rc.d" \
            "$SRC_DIR/files/usr/libexec/rpcd" "$SRC_DIR/files/usr/share/rpcd/acl.d" \
@@ -219,7 +258,6 @@ install -m 0644 "$SCRIPT_DIR/ab/ab-lib.sh"  "$SRC_DIR/files/usr/lib/ab-lib.sh"
 install -m 0755 "$SCRIPT_DIR/ab/ab-bootok"  "$SRC_DIR/files/etc/init.d/ab-bootok"
 ln -sf ../init.d/ab-bootok "$SRC_DIR/files/etc/rc.d/S95ab-bootok"
 
-# LuCI A/B 升级界面与 rpcd 插件
 install -m 0755 "$SCRIPT_DIR/luci/luci.ab" "$SRC_DIR/files/usr/libexec/rpcd/luci.ab"
 install -m 0644 "$SCRIPT_DIR/luci/luci-app-ab-upgrade.json" "$SRC_DIR/files/usr/share/rpcd/acl.d/luci-app-ab-upgrade.json"
 install -m 0644 "$SCRIPT_DIR/luci/flash.js" "$SRC_DIR/files/www/luci-static/resources/view/system/flash.js"
@@ -232,27 +270,14 @@ for f in usr/sbin/ab-upgrade usr/sbin/ab-status usr/sbin/ab-switch usr/sbin/sysu
 done
 echo "  OK: A/B 工具与 LuCI 升级界面已就位 (含 sysupgrade 安全拦截守卫)"
 
-# 既有脚本里缺 rc.d 自启链接的补上 (host-zram 之前既没链接、shebang 也不对)
 ln -sf ../init.d/host-zram "$SRC_DIR/files/etc/rc.d/S15host-zram"
 
-# ---------------------------------------------------------------------------
-# 1.7 安装硬件适配工具 (看门狗 + 健康巡检)
-#
-#   与 A/B 的启动顺序约束: ab-bootok(95) < hw-watchdog(96) < hw-healthd(97)。
-#   喂狗器还会额外等 boot_ok=1 才 arm, 避免新槽启动失败被反复重启、
-#   掩盖 GRUB 的回滚判定。
-# ---------------------------------------------------------------------------
 echo ">>> 安装硬件适配工具 (hw-watchdog / hw-health / hw-healthd)..."
 install -m 0755 "$SCRIPT_DIR/hw/hw-watchdog" "$SRC_DIR/files/etc/init.d/hw-watchdog"
 install -m 0755 "$SCRIPT_DIR/hw/hw-healthd"  "$SRC_DIR/files/etc/init.d/hw-healthd"
 install -m 0755 "$SCRIPT_DIR/hw/hw-health"   "$SRC_DIR/files/usr/sbin/hw-health"
 ln -sf ../init.d/hw-watchdog "$SRC_DIR/files/etc/rc.d/S96hw-watchdog"
 ln -sf ../init.d/hw-healthd  "$SRC_DIR/files/etc/rc.d/S97hw-healthd"
-for f in etc/init.d/hw-watchdog etc/init.d/hw-healthd usr/sbin/hw-health \
-         etc/rc.d/S96hw-watchdog etc/rc.d/S97hw-healthd; do
-    [ -e "$SRC_DIR/files/$f" ] || { echo "!!! 硬件适配工具安装失败: $f"; exit 1; }
-done
-echo "  OK: 硬件适配工具已就位 (S96hw-watchdog / S97hw-healthd)"
 
 install -m 0755 "$SCRIPT_DIR/hw/hw-tune" "$SRC_DIR/files/etc/init.d/hw-tune"
 install -m 0755 "$SCRIPT_DIR/hw/hw-mem"  "$SRC_DIR/files/etc/init.d/hw-mem"
@@ -263,7 +288,7 @@ ln -sf ../init.d/hw-storage-guard "$SRC_DIR/files/etc/rc.d/S98hw-storage-guard"
 [ -e "$SRC_DIR/files/etc/init.d/hw-mem" ] || { echo "!!! hw-mem 安装失败"; exit 1; }
 [ -e "$SRC_DIR/files/etc/init.d/hw-storage-guard" ] || { echo "!!! hw-storage-guard 安装失败"; exit 1; }
 echo "  OK: 运行期调优脚本已就位 (S94hw-mem / S98hw-tune)"
-fi   # INJECT_OVERLAY
+fi   # FW_VARIANT != clean
 
 # ---------------------------------------------------------------------------
 # 2. 注入自定义 QAT 包
@@ -1095,8 +1120,8 @@ fi
 #   闸门 3 只能证明"包被安装了", 不能证明"files/ 覆盖层被 prepare_rootfs 应用"。
 #   这里直接在暂存 rootfs 里找文件本体; 若无暂存目录则降级为警告。
 # ---------------------------------------------------------------------------
-if [ "$INJECT_OVERLAY" = 1 ]; then
-echo ">>> 闸门 4: 断言宿主机覆盖层与 QAT 驱动文件已落在 rootfs 暂存区"
+if [ "$FW_VARIANT" = full ]; then
+echo ">>> 闸门 4: 断言 full 宿主机覆盖层与 QAT 驱动文件已落在 rootfs 暂存区"
 ROOTFS_DIRS=$(find "$SRC_DIR/build_dir" -maxdepth 2 -type d \
     \( -name 'root-x86' -o -name 'root.orig-x86' \) 2>/dev/null || true)
 ROOTFS_SEEN=0
@@ -1118,7 +1143,7 @@ for rd in $ROOTFS_DIRS; do
     # QAT 内核模块本体
     ls "$rd"/lib/modules/*/intel_qat.ko >/dev/null 2>&1 || miss="$miss lib/modules/*/intel_qat.ko"
     if [ -z "$miss" ]; then
-        echo "    ✅ $rd 已包含覆盖层与 QAT 驱动"
+        echo "    ✅ $rd 已包含全量覆盖层与 QAT 驱动"
         ROOTFS_OK=1
     else
         echo "    (未通过 $rd, 缺少:$miss )"
@@ -1128,6 +1153,41 @@ if [ "$ROOTFS_SEEN" -eq 0 ]; then
     echo "    ⚠️ 未定位到 rootfs 暂存目录, 跳过闸门 4 (闸门 3 的清单断言仍然有效)"
 elif [ "$ROOTFS_OK" -eq 0 ]; then
     echo "!!! 覆盖层 / QAT 驱动未进入 rootfs —— 拒绝产出固件"
+    exit 1
+fi
+elif [ "$FW_VARIANT" = clean-ab ]; then
+echo ">>> 闸门 4: 断言 clean-ab 纯净 A/B 基础设施与防掉电配置已就位 (且纯净无额外脚本)"
+ROOTFS_DIRS=$(find "$SRC_DIR/build_dir" -maxdepth 2 -type d \
+    \( -name 'root-x86' -o -name 'root.orig-x86' \) 2>/dev/null || true)
+ROOTFS_SEEN=0
+ROOTFS_OK=0
+for rd in $ROOTFS_DIRS; do
+    [ -d "$rd" ] || continue
+    ROOTFS_SEEN=1
+    miss=""
+    for f in usr/sbin/ab-upgrade usr/sbin/ab-status usr/sbin/ab-switch usr/sbin/sysupgrade \
+             usr/lib/ab-lib.sh etc/init.d/ab-bootok \
+             usr/libexec/rpcd/luci.ab usr/share/rpcd/acl.d/luci-app-ab-upgrade.json \
+             www/luci-static/resources/view/system/flash.js \
+             etc/sysctl.conf etc/uci-defaults/10-ab-clean-storage.sh etc/init.d/hw-storage-guard; do
+        [ -e "$rd/$f" ] || miss="$miss $f"
+    done
+    grep -q 'vm.dirty_bytes' "$rd/etc/sysctl.conf" 2>/dev/null || miss="$miss etc/sysctl.conf(缺dirty_bytes)"
+    # 纯净性反向断言: 额外脚本绝不应存在
+    for dirty in etc/init.d/hw-watchdog etc/init.d/hw-healthd etc/init.d/hw-tune etc/init.d/hw-mem etc/uci-defaults/99-host.sh etc/init.d/host-zram; do
+        [ ! -e "$rd/$dirty" ] || miss="$miss 包含未剔除脚本:$dirty"
+    done
+    if [ -z "$miss" ]; then
+        echo "    ✅ $rd 已包含 A/B 基础设施与防掉电配置，且通过纯净性检验 (无任何多余脚本)"
+        ROOTFS_OK=1
+    else
+        echo "    (未通过 $rd, 检查项:$miss )"
+    fi
+done
+if [ "$ROOTFS_SEEN" -eq 0 ]; then
+    echo "    ⚠️ 未定位到 rootfs 暂存目录, 跳过闸门 4 (闸门 3 的清单断言仍然有效)"
+elif [ "$ROOTFS_OK" -eq 0 ]; then
+    echo "!!! clean-ab 覆盖层或纯净性断言失败 —— 拒绝产出固件"
     exit 1
 fi
 else
