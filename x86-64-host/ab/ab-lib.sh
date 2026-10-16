@@ -73,6 +73,29 @@ ab_ensure_boot() {
     return 0
 }
 
+ab_boot_is_ro() {
+    awk '$2=="/boot" && $4 ~ /(^|,)ro(,|$)/{found=1} END{exit !found}' /proc/mounts 2>/dev/null
+}
+
+ab_boot_rw_begin() {
+    ab_ensure_boot || return 1
+    if ab_boot_is_ro; then
+        mount -o remount,rw /boot 2>/dev/null || return 1
+        export _AB_BOOT_WAS_RO=1
+    else
+        export _AB_BOOT_WAS_RO=0
+    fi
+    return 0
+}
+
+ab_boot_rw_end() {
+    sync
+    if [ "${_AB_BOOT_WAS_RO:-0}" = "1" ]; then
+        mount -o remount,ro /boot 2>/dev/null || true
+        export _AB_BOOT_WAS_RO=0
+    fi
+}
+
 ab_disk_dev() { ab_strip_part "$(ab_boot_dev)"; }
 
 # ---------------------------------------------------------------------------
@@ -266,8 +289,13 @@ ab_env_get() {
     grub-editenv "$e" list 2>/dev/null | sed -n "s/^$1=//p" | head -1
 }
 ab_env_set() {
-    local e; e=$(ab_env_path) || return 1
+    local e rc
+    ab_boot_rw_begin || return 1
+    e=$(ab_env_path) || { ab_boot_rw_end; return 1; }
     grub-editenv "$e" set "$@"
+    rc=$?
+    ab_boot_rw_end
+    return $rc
 }
 
 # 校验 combined 镜像: 有分区表且 p2 为 squashfs -> 回显 "p1起始 p1扇区数 p2起始 p2扇区数"

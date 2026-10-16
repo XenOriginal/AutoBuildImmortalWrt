@@ -72,7 +72,7 @@ echo "    overlay   : $([ "$MIGRATE" = 1 ] && echo '迁移' || echo '不迁移(�
 
 WORK=/tmp/ab-upgrade.$$
 mkdir -p "$WORK"
-trap 'umount "$WORK/mnt" 2>/dev/null || true; [ -n "${NEWLOOP:-}" ] && losetup -d "$NEWLOOP" 2>/dev/null; rm -rf "$WORK"' EXIT INT TERM
+trap 'umount "$WORK/mnt" 2>/dev/null || true; [ -n "${NEWLOOP:-}" ] && losetup -d "$NEWLOOP" 2>/dev/null; ab_boot_rw_end 2>/dev/null || true; rm -rf "$WORK"' EXIT INT TERM
 
 # ---------------------------------------------------------------------------
 # 1. 准备镜像
@@ -102,6 +102,7 @@ fi
 # ---------------------------------------------------------------------------
 # 2. 内核 -> /boot/vmlinuz.<目标槽>
 # ---------------------------------------------------------------------------
+ab_boot_rw_begin || ab_die "无法以读写方式挂载 /boot"
 ab_info "写入内核 -> $KDIR/vmlinuz.$TGT_LETTER"
 mkdir -p "$WORK/mnt"
 mounted=0
@@ -154,6 +155,7 @@ fi
 ab_info "设置 grubenv: next_entry=$NEXT boot_ok=0 bootcount=0"
 ab_env_set next_entry="$NEXT" boot_ok=0 bootcount=0
 grub-editenv "$AB_ENV" list 2>/dev/null | sed 's/^/    /'
+ab_boot_rw_end 2>/dev/null || true
 
 cat <<EOF
 

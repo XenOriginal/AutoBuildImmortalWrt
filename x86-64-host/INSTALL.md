@@ -359,9 +359,14 @@ grub-editenv $E set boot_ok=1 bootcount=0                 # 锁定当前槽
 | 路径 | 作用 |
 | --- | --- |
 | `/usr/sbin/ab-upgrade` | 写非活动槽 + 迁移 overlay + 设置一次性引导 |
-| `/usr/sbin/ab-status` | 查看槽位/grubenv/内核/布局 |
-| `/usr/lib/ab-lib.sh` | 公共库（槽识别、overlay 偏移、裸 GPT/MBR 解析） |
-| `/etc/init.d/ab-bootok` | 健康检查后写 `boot_ok=1`（S95） |
+| `/usr/sbin/ab-status` | 查看槽位/grubenv/内核/布局（支持 `--json`） |
+| `/usr/sbin/ab-switch` | 槽位切换工具（支持一次性安全试跑与永久切换） |
+| `/usr/sbin/sysupgrade` | 原生 sysupgrade 安全守护包装器（自动拦截整盘覆写并转调 ab-upgrade） |
+| `/usr/lib/ab-lib.sh` | 公共库（槽识别、overlay 偏移、裸 GPT/MBR 解析、/boot 读写维护） |
+| `/etc/init.d/ab-bootok` | 健康检查后写 `boot_ok=1`（S95，支持 `confirm` 手动标记） |
+| `/usr/libexec/rpcd/luci.ab` | LuCI A/B 升级 rpcd 后端服务 |
+| `/usr/share/rpcd/acl.d/luci-app-ab-upgrade.json` | LuCI A/B rpcd 权限配置 |
+| `/www/luci-static/resources/view/system/flash.js` | Web 界面升级面板（将危险的 sysupgrade 替换为安全的 A/B 双槽升级看板） |
 | `/etc/init.d/hw-watchdog` / `hw-healthd` / `hw-tune` / `hw-mem` | 看门狗 / 巡检 / 网卡调优 / 内存策略（S96–S98 / S94） |
 | `/etc/hw-tune.conf` | 网卡与 CPU governor 可选开关 |
 | 仓库 `x86-64-host/ab/ab-layout.sh` | 铺盘安装器（在运行系统上对空盘执行） |

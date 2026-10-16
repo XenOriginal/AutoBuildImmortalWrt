@@ -1,0 +1,110 @@
+#!/bin/sh
+# ============================================================================
+# A/B 引导槽位安全切换 (ab-switch)
+#
+#   用法: ab-switch [A|B|toggle] [--permanent] [--reboot] [--yes]
+#
+# 模式:
+#   默认 (一次性引导):
+#     设置 next_entry=<目标槽>, boot_ok=0, bootcount=0
+#     重启后 GRUB 将尝试引导目标槽;
+#     若启动成功且通过健康检查, ab-bootok 会标记 boot_ok=1;
+#     若启动失败, GRUB 会在连续两次失败后自动回滚回原槽!
+#
+#   --permanent (永久切换):
+#     直接将 default=<目标槽> 写入 grubenv。
+#
+#   --reboot:
+#     设置完毕后立即安全重启设备。
+# ============================================================================
+set -eu
+
+if [ -f /usr/lib/ab-lib.sh ]; then
+    . /usr/lib/ab-lib.sh
+elif [ -f "$(dirname "$0")/ab-lib.sh" ]; then
+    . "$(dirname "$0")/ab-lib.sh"
+else
+    echo "!!! 缺少 ab-lib.sh" >&2
+    exit 1
+fi
+
+command -v grub-editenv >/dev/null 2>&1 || ab_die "缺少 grub-editenv"
+
+AB_ENV=$(ab_env_path) || ab_die "找不到 grubenv (内核分区未挂载/非 A/B 布局)"
+DISK=$(ab_disk_dev) || ab_die "找不到系统磁盘"
+
+set -- $(ab_slot_devs)
+SLOT_A_DEV=$1; SLOT_B_DEV=$2
+[ -b "${SLOT_A_DEV:-/nonexistent}" ] || ab_die "找不到槽 A 分区"
+[ -b "${SLOT_B_DEV:-/nonexistent}" ] || ab_die "找不到槽 B 分区"
+
+CUR=$(ab_current_slot "$SLOT_A_DEV" "$SLOT_B_DEV") || ab_die "无法判定当前槽"
+
+TARGET=""
+PERMANENT=0
+DO_REBOOT=0
+ASSUME_YES=0
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        a|A|slot_a|SLOT_A) TARGET="A"; shift ;;
+        b|B|slot_b|SLOT_B) TARGET="B"; shift ;;
+        toggle|next)       TARGET="toggle"; shift ;;
+        --permanent)       PERMANENT=1; shift ;;
+        --reboot)          DO_REBOOT=1; shift ;;
+        -y|--yes)          ASSUME_YES=1; shift ;;
+        -h|--help)
+            sed -n '2,18p' "$0"
+            exit 0
+            ;;
+        *) ab_die "未知参数: $1" ;;
+    esac
+done
+
+if [ -z "$TARGET" ] || [ "$TARGET" = "toggle" ]; then
+    case "$CUR" in
+        A) TARGET="B" ;;
+        B) TARGET="A" ;;
+        *) ab_die "当前槽状态异常 ($CUR), 无法自动对调" ;;
+    esac
+fi
+
+case "$TARGET" in
+    A) TARGET_ENTRY=0 ;;
+    B) TARGET_ENTRY=1 ;;
+    *) ab_die "无效目标槽: $TARGET" ;;
+esac
+
+if [ "$TARGET" = "$CUR" ] && [ "$PERMANENT" = 0 ]; then
+    ab_warn "目标槽与当前运行槽一致 ($TARGET), 无需一次性切换"
+    exit 0
+fi
+
+ab_info "准备切换槽位: 当前槽 [$CUR] -> 目标槽 [$TARGET]"
+if [ "$PERMANENT" = 1 ]; then
+    echo "  模式: 永久切换 (修改 default=$TARGET_ENTRY)"
+else
+    echo "  模式: 一次性安全试跑 (设置 next_entry=$TARGET_ENTRY, 遇故障自动回滚)"
+fi
+
+if [ "$ASSUME_YES" != 1 ]; then
+    printf "确认执行切换? [y/N] "
+    read -r ans
+    case "$ans" in y|Y|yes|YES) ;; *) ab_die "已取消" ;; esac
+fi
+
+if [ "$PERMANENT" = 1 ]; then
+    ab_env_set default="$TARGET_ENTRY" next_entry="" boot_ok=1 bootcount=0
+    ab_info "已永久设置默认启动槽为 [$TARGET]"
+else
+    ab_env_set next_entry="$TARGET_ENTRY" boot_ok=0 bootcount=0
+    ab_info "已设置下次重启尝试引导槽 [$TARGET] (失败自动回滚)"
+fi
+
+grub-editenv "$AB_ENV" list 2>/dev/null | sed 's/^/  /'
+
+if [ "$DO_REBOOT" = 1 ]; then
+    ab_info "正在重启设备..."
+    sync
+    reboot
+fi

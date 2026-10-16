@@ -68,5 +68,20 @@ start() {
     return 1
 }
 
+confirm() {
+    [ -f /usr/lib/ab-lib.sh ] && . /usr/lib/ab-lib.sh
+    if command -v ab_env_set >/dev/null 2>&1; then
+        ab_env_set boot_ok=1 bootcount=0
+    else
+        command -v grub-editenv >/dev/null 2>&1 || { echo "!!! 缺少 grub-editenv" >&2; return 1; }
+        [ -f /boot/grub/grubenv ] && grub-editenv /boot/grub/grubenv set boot_ok=1 bootcount=0
+    fi
+    log "管理员手动标记健康: boot_ok=1 bootcount=0 已写入"
+    echo "✅ 已手动标记当前启动健康 (boot_ok=1, bootcount=0)"
+}
+
+EXTRA_COMMANDS="confirm"
+EXTRA_HELP="        confirm 手动确认当前槽位健康并清零回滚计数"
+
 boot()  { start; }
 reload() { start; }

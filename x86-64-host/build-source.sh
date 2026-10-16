@@ -206,19 +206,31 @@ echo "  OK: 覆盖层已注入并通过完整性断言"
 #   避免"仓库里一份、镜像里另一份"的漂移。
 #   注意 rc.d 符号链接必须显式创建: 仅把脚本放进 /etc/init.d 不会开机自启。
 # ---------------------------------------------------------------------------
-echo ">>> 安装 A/B 工具 (ab-upgrade / ab-status / ab-bootok)..."
+echo ">>> 安装 A/B 工具 (ab-upgrade / ab-status / ab-switch / ab-bootok / sysupgrade-wrapper)..."
 install -d "$SRC_DIR/files/usr/sbin" "$SRC_DIR/files/usr/lib" \
-           "$SRC_DIR/files/etc/init.d" "$SRC_DIR/files/etc/rc.d"
+           "$SRC_DIR/files/etc/init.d" "$SRC_DIR/files/etc/rc.d" \
+           "$SRC_DIR/files/usr/libexec/rpcd" "$SRC_DIR/files/usr/share/rpcd/acl.d" \
+           "$SRC_DIR/files/www/luci-static/resources/view/system"
 install -m 0755 "$SCRIPT_DIR/ab/ab-upgrade" "$SRC_DIR/files/usr/sbin/ab-upgrade"
 install -m 0755 "$SCRIPT_DIR/ab/ab-status"  "$SRC_DIR/files/usr/sbin/ab-status"
+install -m 0755 "$SCRIPT_DIR/ab/ab-switch"  "$SRC_DIR/files/usr/sbin/ab-switch"
+install -m 0755 "$SCRIPT_DIR/ab/sysupgrade-wrapper" "$SRC_DIR/files/usr/sbin/sysupgrade"
 install -m 0644 "$SCRIPT_DIR/ab/ab-lib.sh"  "$SRC_DIR/files/usr/lib/ab-lib.sh"
 install -m 0755 "$SCRIPT_DIR/ab/ab-bootok"  "$SRC_DIR/files/etc/init.d/ab-bootok"
 ln -sf ../init.d/ab-bootok "$SRC_DIR/files/etc/rc.d/S95ab-bootok"
-for f in usr/sbin/ab-upgrade usr/sbin/ab-status usr/lib/ab-lib.sh \
-         etc/init.d/ab-bootok etc/rc.d/S95ab-bootok; do
-    [ -e "$SRC_DIR/files/$f" ] || { echo "!!! A/B 工具安装失败: $f"; exit 1; }
+
+# LuCI A/B 升级界面与 rpcd 插件
+install -m 0755 "$SCRIPT_DIR/luci/luci.ab" "$SRC_DIR/files/usr/libexec/rpcd/luci.ab"
+install -m 0644 "$SCRIPT_DIR/luci/luci-app-ab-upgrade.json" "$SRC_DIR/files/usr/share/rpcd/acl.d/luci-app-ab-upgrade.json"
+install -m 0644 "$SCRIPT_DIR/luci/flash.js" "$SRC_DIR/files/www/luci-static/resources/view/system/flash.js"
+
+for f in usr/sbin/ab-upgrade usr/sbin/ab-status usr/sbin/ab-switch usr/sbin/sysupgrade \
+         usr/lib/ab-lib.sh etc/init.d/ab-bootok etc/rc.d/S95ab-bootok \
+         usr/libexec/rpcd/luci.ab usr/share/rpcd/acl.d/luci-app-ab-upgrade.json \
+         www/luci-static/resources/view/system/flash.js; do
+    [ -e "$SRC_DIR/files/$f" ] || { echo "!!! A/B 工具或 LuCI 界面安装失败: $f"; exit 1; }
 done
-echo "  OK: A/B 工具已就位 (含 /etc/rc.d/S95ab-bootok 自启链接)"
+echo "  OK: A/B 工具与 LuCI 升级界面已就位 (含 sysupgrade 安全拦截守卫)"
 
 # 既有脚本里缺 rc.d 自启链接的补上 (host-zram 之前既没链接、shebang 也不对)
 ln -sf ../init.d/host-zram "$SRC_DIR/files/etc/rc.d/S15host-zram"
