@@ -293,3 +293,21 @@ jobs:
             bin/packages/x86_64/base/qat-*.apk
           if-no-files-found: warn
           retention-days: 30
+
+      - name: Publish Release for direct download
+        uses: softprops/action-gh-release@v2
+        if: success()
+        with:
+          tag_name: latest-clean-ab
+          name: "ImmortalWrt 25.12 Host Clean-AB (Latest Build)"
+          body: |
+            ## ImmortalWrt x86-64 Host Clean-AB 固件自动发布
+            - 构建变体: `clean-ab` (纯净 A/B 双槽版 + 硬盘防掉电拓扑)
+            - 对应提交: ${{ github.sha }}
+            - 包含 Legacy Combined 与 UEFI Combined 双合盘镜像
+          files: |
+            bin/targets/x86/64/*.img.gz
+            bin/targets/x86/64/*.manifest
+            bin/targets/x86/64/sha256sums
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
