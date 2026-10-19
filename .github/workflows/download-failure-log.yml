@@ -22,8 +22,9 @@ jobs:
         run: |
           ls -la log
           cp log/build-host.log debug-failure.log
+          cp log/df.txt debug-df.txt || true
           git config user.name github-actions
           git config user.email github-actions@github.com
-          git add debug-failure.log
+          git add debug-failure.log debug-df.txt
           git commit -m 'debug: publish run 39213037682 failure log'
           git push origin HEAD:debug-log
