@@ -78,6 +78,13 @@ ab_boot_is_ro() {
 }
 
 ab_boot_rw_begin() {
+    # Re-entrant: ab-upgrade calls this for the kernel copy and again from
+    # ab_env_set().  Preserve the original ro/rw state across the whole
+    # operation, otherwise the second call loses _AB_BOOT_WAS_RO and leaves
+    # /boot writable after the upgrade.
+    if [ "${_AB_BOOT_ACTIVE:-0}" = "1" ]; then
+        return 0
+    fi
     ab_ensure_boot || return 1
     if ab_boot_is_ro; then
         mount -o remount,rw /boot 2>/dev/null || return 1
@@ -85,15 +92,18 @@ ab_boot_rw_begin() {
     else
         export _AB_BOOT_WAS_RO=0
     fi
+    export _AB_BOOT_ACTIVE=1
     return 0
 }
 
 ab_boot_rw_end() {
+    [ "${_AB_BOOT_ACTIVE:-0}" = "1" ] || return 0
     sync
     if [ "${_AB_BOOT_WAS_RO:-0}" = "1" ]; then
         mount -o remount,ro /boot 2>/dev/null || true
-        export _AB_BOOT_WAS_RO=0
     fi
+    export _AB_BOOT_WAS_RO=0
+    export _AB_BOOT_ACTIVE=0
 }
 
 ab_disk_dev() { ab_strip_part "$(ab_boot_dev)"; }
@@ -258,7 +268,39 @@ ab_seed_overlay() { # $1=目标分区设备 $2=偏移(4KiB 对齐) $3=大小(MiB
     if [ -n "${4:-}" ] && [ -d "$4" ]; then
         mkdir -p "$m"
         if mount -o loop "$f" "$m" 2>/dev/null; then
-            ( cd "$4" && tar -cf - . ) | tar -C "$m" -xf - || rc=1
+            # Only migrate mutable configuration/state, not the old image's
+            # binaries, init scripts or package database.  The new rootfs
+            # lower layer must supply those; otherwise an A/B upgrade would
+            # silently resurrect the old fsck/nfs/poweroff scripts and even
+            # the old apk database.
+            EXCL="/tmp/ab-ovl.excl.$$"
+            cat > "$EXCL" <<'EXCLUDES'
+./usr
+./usr/*
+./bin
+./bin/*
+./sbin
+./sbin/*
+./lib
+./lib/*
+./etc/init.d
+./etc/init.d/*
+./etc/hotplug.d
+./etc/hotplug.d/*
+./etc/rc.d
+./etc/rc.d/*
+./etc/modules.d
+./etc/modules.d/*
+./etc/uci-defaults
+./etc/uci-defaults/*
+./etc/sysctl.conf
+./etc/ab-bootopts
+./etc/hw-storage-guard.conf
+./var
+./var/*
+EXCLUDES
+            ( cd "$4" && tar -cf - -X "$EXCL" . ) | tar -C "$m" -xf - || rc=1
+            rm -f "$EXCL"
             sync
             umount "$m"
         else

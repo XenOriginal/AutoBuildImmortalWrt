@@ -242,9 +242,9 @@ fsck_esp() {
 	_dev="$1"
 	_mnt="$2"
 
-	if is_mounted "$_mnt"; then
-		say "跳过 vfat $_dev: $_mnt 已挂载"
-		record "esp=$_dev" "skip(mounted $_mnt)"
+	if is_mounted "$_mnt" || is_mounted /boot || is_mounted /mnt/sda1; then
+		say "跳过 vfat $_dev: ESP 已挂载 (/boot 或 /mnt/sda1)"
+		record "esp=$_dev" "skip(mounted ESP)"
 		return 0
 	fi
 	wait_dev "$_dev" || { say "跳过 vfat $_dev: 设备节点不存在"; record "esp=$_dev" "skip(no-dev)"; return 0; }

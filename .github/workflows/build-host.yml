@@ -41,6 +41,10 @@ on:
 permissions:
   contents: write
 
+concurrency:
+  group: build-host-production
+  cancel-in-progress: true
+
 jobs:
   build:
     runs-on: ubuntu-22.04
