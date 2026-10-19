@@ -67,11 +67,11 @@ jobs:
           sudo apt-get install -y -qq \
             build-essential ccache ecj fastjar file g++ gawk gettext git \
             java-propose-classpath libelf-dev libncurses5-dev libncursesw5-dev \
-            libssl-dev python3 python3-setuptools python3-dev rsync subversion \
+            libssl-dev python3 python3-setuptools python3-distutils python3-dev rsync subversion \
             swig time xsltproc zlib1g-dev unzip wget genisoimage libncurses-dev \
-            default-jre-headless ca-certificates-java flex bison bc cpio
+            default-jre-headless ca-certificates-java flex bison bc cpio bzip2
 
-      - name: Build in Ubuntu 22.04 container
+      - name: Build firmware on runner
         env:
           IMM_BRANCH: ${{ inputs.imm_branch || 'openwrt-25.12' }}
           IMM_COMMIT: ${{ inputs.imm_commit || '214e26e407172790c0045f59afe03a9715608ef8' }}
@@ -80,34 +80,37 @@ jobs:
           FEATURES: ${{ inputs.features || '' }}
           FW_VARIANT: 'clean-ab'
         run: |
-          set -e
+          set -eux
           chmod +x x86-64-host/build-source.sh x86-64-host/apply-features.sh
-          docker run --rm \
-            --user root --privileged \
-            -v "$PWD:/work" \
-            -v "$PWD/qat-src:/host-qat:ro" \
-            -v "$PWD/host-files:/host-files:ro" \
-            -e IMM_BRANCH="$IMM_BRANCH" \
-            -e IMM_COMMIT="$IMM_COMMIT" \
-            -e PROFILE="$PROFILE" \
-            -e INCLUDE_DOCKER="$INCLUDE_DOCKER" \
-            -e FEATURES="$FEATURES" \
-            -e FW_VARIANT="$FW_VARIANT" \
-            -e FORCE_UNSAFE_CONFIGURE=1 \
-            -w /work \
-            ubuntu:22.04 \
-            /bin/bash -c '
-              set -e
-              apt-get update -qq
-              DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
-                build-essential ccache ecj fastjar file g++ gawk gettext git \
-                java-propose-classpath libelf-dev libncurses5-dev libncursesw5-dev \
-                libssl-dev python3 python3-setuptools python3-dev rsync subversion \
-                swig time xsltproc zlib1g-dev unzip wget sudo bzip2 gzip tar patch \
-                perl cpio bc genisoimage libncurses-dev default-jre-headless \
-                ca-certificates-java flex bison
-              bash /work/x86-64-host/build-source.sh
-            '
+          sudo mkdir -p /mnt/build
+          sudo chown -R "$USER":"$USER" /mnt/build
+          export WORK_ROOT="$GITHUB_WORKSPACE"
+          export SRC_DIR="/mnt/build/immortalwrt"
+          export HOST_QAT="$GITHUB_WORKSPACE/qat-src"
+          export HOST_FILES="$GITHUB_WORKSPACE/host-files"
+          export OUT_ROOT="$GITHUB_WORKSPACE"
+          export OUT_DIR="$GITHUB_WORKSPACE/bin"
+          export FORCE_UNSAFE_CONFIGURE=1
+          bash x86-64-host/build-source.sh
+
+      - name: Collect build failure log
+        if: failure()
+        run: |
+          mkdir -p failure
+          if [ -f /mnt/build/immortalwrt/build-host.log ]; then
+            tail -5000 /mnt/build/immortalwrt/build-host.log > failure/build-host.log
+          else
+            echo "build-host.log not found" > failure/build-host.log
+          fi
+          df -h / /mnt > failure/df.txt || true
+
+      - name: Upload build failure log
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-failure-log
+          path: failure/
+          if-no-files-found: warn
 
       - name: Verify manifest and images
         run: |

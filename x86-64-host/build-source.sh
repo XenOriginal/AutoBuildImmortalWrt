@@ -54,7 +54,14 @@ AB_ONLY_PATCHES="0001-grub2-embed-loadenv-saveenv.patch"
 # 必须显式跳过该检查, 否则 tools/tar 构建失败。
 export FORCE_UNSAFE_CONFIGURE=1
 
-SRC_DIR="/work/immortalwrt"
+# Build roots.  Defaults are for the historical Docker runner, but the CI
+# workflow runs directly on the Ubuntu 22.04 runner and overrides these.
+WORK_ROOT="${WORK_ROOT:-/work}"
+SRC_DIR="${SRC_DIR:-$WORK_ROOT/immortalwrt}"
+HOST_QAT="${HOST_QAT:-/host-qat}"
+HOST_FILES="${HOST_FILES:-/host-files}"
+OUT_ROOT="${OUT_ROOT:-$WORK_ROOT}"
+OUT_DIR="${OUT_DIR:-$OUT_ROOT/bin}"
 REPO_URL="https://github.com/immortalwrt/immortalwrt.git"
 REPO_BRANCH="${IMM_BRANCH:-openwrt-25.12}"
 # 【可选】固定到指定提交(推荐用于分发版): 分支 tip 会随时移动, 上游包偶发回归
@@ -182,8 +189,8 @@ else
   #   - 硬件看门狗、健康巡检、网卡调优
   #   - /etc/init.d/umount 保护性补丁
   #   - rc.d 静态钩子与重启/关机顺序
-  if [ -d /host-files ]; then
-      OVERLAY=/host-files
+  if [ -d "$HOST_FILES" ]; then
+      OVERLAY="$HOST_FILES"
   elif [ -d "$SCRIPT_DIR/../host-files" ]; then
       OVERLAY="$SCRIPT_DIR/../host-files"
   else
@@ -245,7 +252,7 @@ else
       || { echo "!!! poweroff 不是带 S5 兜底的引擎"; exit 1; }
   grep -q 'wrtpatch-umount' "$SRC_DIR/files/etc/init.d/umount" \
       || { echo "!!! umount 未打 NFS 安全补丁"; exit 1; }
-  grep -q 'hotplug/block/00-fsck-guard' "$SRC_DIR/files/etc/hotplug.d/block/00-fsck-guard" \
+  grep -q '/usr/local/bin/fsck-guard boot' "$SRC_DIR/files/etc/hotplug.d/block/00-fsck-guard" \
       || { echo "!!! fsck hotplug 闸门内容异常"; exit 1; }
 
   echo "  OK: 生产覆盖层与 A/B 工具链已就位"
@@ -256,8 +263,8 @@ fi
 # ---------------------------------------------------------------------------
 echo ">>> 注入 QAT 驱动包与固件包..."
 mkdir -p package/qat
-cp -r /host-qat/qat-kmod    package/qat/
-cp -r /host-qat/qat-firmware package/qat/
+cp -r "$HOST_QAT/qat-kmod"    package/qat/
+cp -r "$HOST_QAT/qat-firmware" package/qat/
 echo "--- package/qat 内容 ---"
 find package/qat -type f | sort
 
@@ -1192,12 +1199,12 @@ find "bin/targets/x86/64" -path "*${KVER}*" \( -name '*qat*.ko*' -o -name '*qat*
 # 8. 把产物复制到挂载点 /work/bin —— 容器销毁后仍可被 upload-artifact 取到
 #    (/work 是宿主机 $PWD 的挂载点; SRC_DIR 在容器可写层, 必须显式复制出来)
 # ---------------------------------------------------------------------------
-echo ">>> 复制产物到 /work/bin ..."
-mkdir -p /work/bin
-cp -a bin/. /work/bin/ 2>/dev/null || cp -a bin/* /work/bin/ 2>/dev/null || true
-echo "--- /work/bin 内容 ---"
-ls -lah /work/bin/targets/x86/64/ 2>/dev/null | head -30 || echo "(复制失败)"
+echo ">>> 复制产物到 $OUT_DIR ..."
+mkdir -p "$OUT_DIR"
+cp -a bin/. "$OUT_DIR"/ 2>/dev/null || cp -a bin/* "$OUT_DIR"/ 2>/dev/null || true
+echo "--- $OUT_DIR 内容 ---"
+ls -lah "$OUT_DIR/targets/x86/64/" 2>/dev/null | head -30 || echo "(复制失败)"
 
 # 同时导出最终 .config 与 QAT 内核配置, 便于复核
-cp -f .config /work/host-final.config 2>/dev/null || true
+cp -f .config "$OUT_ROOT/host-final.config" 2>/dev/null || true
 echo ">>> 完成"
