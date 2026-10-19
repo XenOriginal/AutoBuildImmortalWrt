@@ -59,13 +59,13 @@ PARTUUID_B=$(blkid -s PARTUUID -o value "${SLOT_B_DEV:-/nonexistent}" 2>/dev/nul
 
 KA_SIZE=0; KA_TIME=""
 if [ -f "$KDIR/vmlinuz.a" ]; then
-    KA_SIZE=$(stat -c%s "$KDIR/vmlinuz.a" 2>/dev/null || echo 0)
+    KA_SIZE=$(wc -c < "$KDIR/vmlinuz.a" 2>/dev/null || echo 0)
     KA_TIME=$(date -r "$KDIR/vmlinuz.a" '+%Y-%m-%d %H:%M:%S' 2>/dev/null || echo "")
 fi
 
 KB_SIZE=0; KB_TIME=""
 if [ -f "$KDIR/vmlinuz.b" ]; then
-    KB_SIZE=$(stat -c%s "$KDIR/vmlinuz.b" 2>/dev/null || echo 0)
+    KB_SIZE=$(wc -c < "$KDIR/vmlinuz.b" 2>/dev/null || echo 0)
     KB_TIME=$(date -r "$KDIR/vmlinuz.b" '+%Y-%m-%d %H:%M:%S' 2>/dev/null || echo "")
 fi
 
@@ -135,7 +135,7 @@ printf "槽 B        : %s  PARTUUID=%s\n" "${SLOT_B_DEV:-无}" "${PARTUUID_B:-�
 echo
 echo "内核        :"
 for f in "$KDIR"/vmlinuz.a "$KDIR"/vmlinuz.b; do
-    [ -f "$f" ] && printf "  %-18s %s 字节  %s\n" "$f" "$(stat -c%s "$f")" "$(date -r "$f" '+%Y-%m-%d %H:%M' 2>/dev/null || true)"
+    [ -f "$f" ] && printf "  %-18s %s 字节  %s\n" "$f" "$(wc -c < "$f" 2>/dev/null || echo 0)" "$(date -r "$f" '+%Y-%m-%d %H:%M' 2>/dev/null || true)"
 done
 echo
 echo "grubenv ($AB_ENV):"

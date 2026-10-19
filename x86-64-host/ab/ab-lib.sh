@@ -69,7 +69,7 @@ ab_ensure_boot() {
     ab_boot_mounted && return 0
     b=$(ab_boot_dev) || return 1
     mkdir -p /boot
-    mount -t vfat "$b" /boot 2>/dev/null || mount "$b" /boot 2>/dev/null || return 1
+    mount -t vfat -o ro,noatime "$b" /boot 2>/dev/null || mount -o ro,noatime "$b" /boot 2>/dev/null || return 1
     return 0
 }
 

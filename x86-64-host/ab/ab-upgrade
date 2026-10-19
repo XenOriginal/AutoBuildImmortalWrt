@@ -73,7 +73,7 @@ echo "    磁盘      : $DISK"
 CUR_IDX=3; [ "$CUR" = B ] && CUR_IDX=4
 echo "    当前槽    : $CUR ($(ab_partuuid_gpt "$DISK" "$CUR_IDX" 2>/dev/null))"
 echo "    目标槽    : $TGT ($TGT_DEV)"
-echo "    镜像      : $IMAGE ($(stat -c%s "$IMAGE" 2>/dev/null || echo '?') 字节)"
+echo "    镜像      : $IMAGE ($(wc -c < "$IMAGE" 2>/dev/null || echo '?') 字节)"
 echo "    overlay   : $([ "$MIGRATE" = 1 ] && echo '迁移' || echo '不迁移(新槽将使用默认配置)')"
 
 WORK=/tmp/ab-upgrade.$$
