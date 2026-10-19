@@ -18,6 +18,12 @@ jobs:
           github-token: ${{ secrets.GITHUB_TOKEN }}
           repository: XenOriginal/AutoBuildImmortalWrt
           path: log
+      - name: Fetch full job log
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          curl -sS -L -H "Authorization: Bearer $GH_TOKEN"             -H "Accept: application/vnd.github+json"             "https://api.github.com/repos/XenOriginal/AutoBuildImmortalWrt/actions/jobs/117953491701/logs"             -o debug-job.log || true
+          wc -c debug-job.log || true
       - name: Publish log on debug branch
         run: |
           ls -la log
@@ -25,6 +31,6 @@ jobs:
           cp log/df.txt debug-df.txt || true
           git config user.name github-actions
           git config user.email github-actions@github.com
-          git add debug-failure.log debug-df.txt
-          git commit -m 'debug: publish run 39213037682 failure log'
+          git add debug-failure.log debug-df.txt debug-job.log
+          git commit -m 'debug: publish run 39220210861 failure log, df and full job log'
           git push origin HEAD:debug-log
