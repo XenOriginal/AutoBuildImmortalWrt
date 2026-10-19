@@ -1,0 +1,29 @@
+name: Download failure log
+on:
+  push:
+    branches:
+      - debug-log
+permissions:
+  actions: read
+  contents: write
+jobs:
+  getlog:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: build-failure-log
+          run-id: 39213037682
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          repository: XenOriginal/AutoBuildImmortalWrt
+          path: log
+      - name: Publish log on debug branch
+        run: |
+          ls -la log
+          cp log/build-host.log debug-failure.log
+          git config user.name github-actions
+          git config user.email github-actions@github.com
+          git add debug-failure.log
+          git commit -m 'debug: publish run 39213037682 failure log'
+          git push origin HEAD:debug-log
