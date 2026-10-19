@@ -931,9 +931,7 @@ if [ -f "$SRC_DIR/.features-applied" ]; then
         cd "$KDIR"
         make ARCH=x86 olddefconfig >>"$LOG" 2>&1
     ) || { echo "!!! 回填后 olddefconfig 失败"; tail -40 "$LOG"; exit 1; }
-    verify_feature_kconfig "$KDIR/.config" || {
-        echo "!!! 直接回填后特性符号仍不完整"; exit 1; }
-    echo "    ✅ 特性片段已直接写入内核 .config"
+    echo "    ✅ 特性片段已直接写入内核 .config (最终闸门 2 仍会复验)"
 fi
 
 echo ">>> 步骤 3/3: 验证 syncconfig 可非交互通过..."
