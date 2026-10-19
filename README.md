@@ -67,3 +67,5 @@ ab-upgrade /tmp/immortalwrt-...-combined-efi.img.gz --update-boot --yes
 ```
 
 `--update-boot` is opt-in; ordinary A/B tests leave the bootloader alone.
+
+<!-- build trigger: 20261019T052409Z -->
