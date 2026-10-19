@@ -23,7 +23,7 @@ PKG_BUILD_DIR:=$(KERNEL_BUILD_DIR)/packages
 include $(INCLUDE_DIR)/package.mk
 
 define Build/Prepare
-mkdir -p $(PKG_BUILD_DIR)
+	mkdir -p $(PKG_BUILD_DIR)
 endef
 
 define Build/Configure

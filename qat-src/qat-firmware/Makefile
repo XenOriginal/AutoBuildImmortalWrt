@@ -50,18 +50,18 @@ define Package/qat-firmware-c3xxx/description
 endef
 
 define Build/Prepare
-mkdir -p $(PKG_BUILD_DIR)
-$(CP) $(DL_DIR)/qat_c3xxx.bin $(PKG_BUILD_DIR)/
-$(CP) $(DL_DIR)/qat_c3xxx_mmp.bin $(PKG_BUILD_DIR)/
+	mkdir -p $(PKG_BUILD_DIR)
+	$(CP) $(DL_DIR)/qat_c3xxx.bin $(PKG_BUILD_DIR)/
+	$(CP) $(DL_DIR)/qat_c3xxx_mmp.bin $(PKG_BUILD_DIR)/
 endef
 
 define Build/Compile
 endef
 
 define Package/qat-firmware-c3xxx/install
-$(INSTALL_DIR) $(1)/lib/firmware
-$(INSTALL_DATA) $(PKG_BUILD_DIR)/qat_c3xxx.bin $(1)/lib/firmware/qat_c3xxx.bin
-$(INSTALL_DATA) $(PKG_BUILD_DIR)/qat_c3xxx_mmp.bin $(1)/lib/firmware/qat_c3xxx_mmp.bin
+	$(INSTALL_DIR) $(1)/lib/firmware
+	$(INSTALL_DATA) $(PKG_BUILD_DIR)/qat_c3xxx.bin $(1)/lib/firmware/qat_c3xxx.bin
+	$(INSTALL_DATA) $(PKG_BUILD_DIR)/qat_c3xxx_mmp.bin $(1)/lib/firmware/qat_c3xxx_mmp.bin
 endef
 
 $(eval $(call BuildPackage,qat-firmware-c3xxx))
