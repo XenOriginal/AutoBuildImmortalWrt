@@ -53,6 +53,10 @@ Key changes in this branch:
 7. **KVM/VFIO/QEMU/THP/HugeTLB** are built in.
 8. **Intel microcode** and UEFI tools (`efibootmgr`, `efivar`, `efivarfs`) are
    included.
+9. **Denverton CPU P-state support**: a kernel patch adds
+   `INTEL_ATOM_GOLDMONT_D` to `intel_pstate`; the command line includes
+   `acpi=force intel_pstate=passive`.  See `docs/PITFALLS.md` for the
+   1 GHz root cause and the BIOS `BIOS Request Frequency` fallback.
 
 ## Safety
 

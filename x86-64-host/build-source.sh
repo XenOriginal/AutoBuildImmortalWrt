@@ -913,6 +913,29 @@ echo ">>> 步骤 2/3: 落盘内核配置 (olddefconfig / yes '' | make oldconfig
 }
 echo "    oldconfig 完成"
 
+# ---------------------------------------------------------------------------
+# 5.5c 直接回填特性片段到已解压内核的 .config
+#
+# 【实测】只把 kconfig 行写进 target/linux/x86/64/config-6.12 时，OpenWrt
+# 的合并/olddefconfig 路径在部分版本上会静默丢弃 DEBUG_KERNEL 依赖项
+# （55-lockup-detect 的 DETECT_HUNG_TASK / SOFTLOCKUP_DETECTOR 在 run 9
+# 最终 .config 中变成未设置）。这里在 KDIR 已存在、oldconfig 已落盘之后
+# 再直接写一次 .config，并再次 olddefconfig；这样最终编译使用的就是确认
+# 过的配置，不再依赖 target config 的合并时序。
+# ---------------------------------------------------------------------------
+if [ -f "$SRC_DIR/.features-applied" ]; then
+    echo ">>> 步骤 2b/3: 直接回填特性片段到 $KDIR/.config..."
+    bash "$SCRIPT_DIR/apply-features.sh" --stage kconfig         --kconfig "$KDIR/.config"         --stamp /tmp/feature-kconfig-direct.stamp >>"$LOG" 2>&1 || {
+        echo "!!! 直接回填特性片段失败"; tail -40 "$LOG"; exit 1; }
+    (
+        cd "$KDIR"
+        make ARCH=x86 olddefconfig >>"$LOG" 2>&1
+    ) || { echo "!!! 回填后 olddefconfig 失败"; tail -40 "$LOG"; exit 1; }
+    verify_feature_kconfig "$KDIR/.config" || {
+        echo "!!! 直接回填后特性符号仍不完整"; exit 1; }
+    echo "    ✅ 特性片段已直接写入内核 .config"
+fi
+
 echo ">>> 步骤 3/3: 验证 syncconfig 可非交互通过..."
 if ( cd "$KDIR" && make ARCH=x86 syncconfig </dev/null >/tmp/syncconfig-test.log 2>&1 ); then
     echo "    ✅ 内核配置已定型, 无残留 NEW 符号"

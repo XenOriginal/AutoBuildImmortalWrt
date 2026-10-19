@@ -121,3 +121,20 @@ the ACPI `_PPC`/SMM handoff (`acpi_processor_pstate_control()` writes the FADT
 `PSTATE_CNT` value 0x80 to SMI port 0xB2); this is why `acpi=force` is on the
 command line.  Raw writes to `IA32_PERF_CTL` alone were verified insufficient
 on the old ACPI-disabled boot.
+
+### BIOS fallback (if the OS still runs at 1 GHz)
+
+The setup screen `Power -> Advanced CPU Control` has:
+
+- `EIST (GV3)` = `Enable`;
+- `BIOS Request Frequency` = `Enable` (InsydeH2O help: “Auto - Enable for B0
+  CPU stepping, all others disabled, change setting to override.”);
+- `CPU Flex Ratio Override` = `Disable`.
+
+This host is B0 stepping (CPUID `0x506F1`), so the firmware automatically
+enables the `BIOS Request Frequency` workaround.  If the new image loads
+`intel_pstate` and exposes `/sys/devices/system/cpu/cpufreq/policy0`, but the
+measured effective frequency is still ~1 GHz, override that workaround in the
+BIOS: set `BIOS Request Frequency` to `Disable`, keep `CPU Flex Ratio Override`
+at `Disable`, save and reboot.  This is an SMM/firmware P-state request and
+cannot be overridden reliably from Linux.
