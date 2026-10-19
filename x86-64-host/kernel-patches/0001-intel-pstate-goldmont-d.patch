@@ -1,0 +1,10 @@
+--- a/drivers/cpufreq/intel_pstate.c
++++ b/drivers/cpufreq/intel_pstate.c
+@@ -2644,6 +2644,7 @@ static const struct x86_cpu_id intel_pstate_cpu_ids[] = {
+ 	X86_MATCH(INTEL_XEON_PHI_KNL,		knl_funcs),
+ 	X86_MATCH(INTEL_XEON_PHI_KNM,		knl_funcs),
+ 	X86_MATCH(INTEL_ATOM_GOLDMONT,		core_funcs),
++	X86_MATCH(INTEL_ATOM_GOLDMONT_D,	core_funcs),
+ 	X86_MATCH(INTEL_ATOM_GOLDMONT_PLUS,	core_funcs),
+ 	X86_MATCH(INTEL_SKYLAKE_X,		core_funcs),
+ 	X86_MATCH(INTEL_COMETLAKE,		core_funcs),

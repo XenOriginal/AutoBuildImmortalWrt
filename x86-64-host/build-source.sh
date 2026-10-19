@@ -354,7 +354,7 @@ echo 'CONFIG_GRUB_BAUDRATE=57600' >> .config
 #   BIOS 未开 VT-d 时该参数无副作用 (没有 DMAR 表就不会激活)。
 #   配套的软件侧 (VFIO 模块) 由特性片段 15-iommu-vtd 负责。
 sed -i "/^CONFIG_GRUB_BOOTOPTS=/d" .config
-echo 'CONFIG_GRUB_BOOTOPTS="console=ttyS4,57600n8 console=tty0 intel_iommu=on iommu=pt acpi=force"' >> .config
+echo 'CONFIG_GRUB_BOOTOPTS="console=ttyS4,57600n8 console=tty0 intel_iommu=on iommu=pt acpi=force intel_pstate=passive"' >> .config
 
 # ---- 宿主机必备软件包 ----
 HOST_PKGS="
@@ -872,6 +872,28 @@ if [ ! -f "$KDIR/Makefile" ]; then
     exit 1
 fi
 echo "    内核目录: $KDIR"
+
+# ---------------------------------------------------------------------------
+# 5.5b Apply kernel-source patches (Denverton / intel_pstate)
+# ---------------------------------------------------------------------------
+echo ">>> 应用内核源码补丁..."
+shopt -s nullglob
+for kp in "$SCRIPT_DIR"/kernel-patches/*.patch; do
+    _kb=$(basename "$kp")
+    if patch -p1 -d "$KDIR" --dry-run < "$kp" >/dev/null 2>&1; then
+        patch -p1 -d "$KDIR" < "$kp" >/dev/null || {
+            echo "!!! 内核补丁应用失败: $_kb"; exit 1; }
+        grep -q 'INTEL_ATOM_GOLDMONT_D' "$KDIR/drivers/cpufreq/intel_pstate.c" \
+            || { echo "!!! 内核补丁已应用但标记缺失: $_kb"; exit 1; }
+        echo "    已应用: $_kb"
+    elif grep -q 'INTEL_ATOM_GOLDMONT_D' "$KDIR/drivers/cpufreq/intel_pstate.c" 2>/dev/null; then
+        echo "    已存在(跳过): $_kb"
+    else
+        echo "!!! 内核补丁无法应用: $_kb"
+        exit 1
+    fi
+done
+shopt -u nullglob
 
 echo ">>> 步骤 2/3: 落盘内核配置 (olddefconfig / yes '' | make oldconfig)..."
 # 注意: 顶层开启了 set -o pipefail。

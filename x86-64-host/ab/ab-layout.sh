@@ -46,7 +46,7 @@ TMPL="$SCRIPT_DIR/grub.cfg.ab.tmpl"
 
 DISK=""; IMAGE=""; CORE_IMG=""; OVERLAY_MODE="per-slot"
 BOOT_MIB=512; SLOT_MIB=2048; OVERLAY_MIB=16384; DATA_MIB=0
-BOOTOPTS="console=ttyS4,57600n8 console=tty0 intel_iommu=on iommu=pt acpi=force"
+BOOTOPTS="console=ttyS4,57600n8 console=tty0 intel_iommu=on iommu=pt acpi=force intel_pstate=passive"
 GRUB_TIMEOUT=3; GRUB_BAUD=57600; ASSUME_YES=0
 MNT=/tmp/ab-layout.mnt; WORK=/tmp/ab-layout.work
 

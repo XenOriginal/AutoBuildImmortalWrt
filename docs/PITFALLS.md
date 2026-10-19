@@ -87,3 +87,37 @@ image. If ECC was a requirement, replace the DIMMs.
 The Samsung M.2 SMART is PASSED, but it has one reallocated sector, one runtime
 bad block and a historical UDMA CRC count (97). Continue monitoring; run a long
 self-test in a maintenance window.
+
+## 9. CPU stuck at ~1 GHz (Denverton)
+
+Measured on the live host: `perf_event` CPU cycles over a pinned busy loop gave
+~0.95 GHz, while `MSR_PLATFORM_INFO` reports a 20× max ratio (2.0 GHz).  This is
+not thermal throttling (no throttle events, 53 °C), not a PL1/PL2 limit, and not
+`IA32_PERF_CTL` being unreadable (the earlier `dd` test used `bs=8 skip=0x199`,
+which addresses MSR `0xCC8`, not `0x199`).
+
+Root cause in the old image: `intel_pstate` rejects `INTEL_ATOM_GOLDMONT_D`
+(Denverton, family 6 model 0x5F); `acpi-cpufreq` has no `_PSS` policy.  There is
+no OS component driving `IA32_PERF_CTL`.
+
+This image:
+
+- applies `x86-64-host/kernel-patches/0001-intel-pstate-goldmont-d.patch`
+  adding `X86_MATCH(INTEL_ATOM_GOLDMONT_D, core_funcs)`;
+- adds `acpi=force intel_pstate=passive` to the GRUB command line;
+- keeps `/proc/config.gz` available for post-boot verification.
+
+Verification after boot:
+
+```sh
+dmesg | grep -i intel_pstate      # should NOT say "CPU model not supported"
+ls /sys/devices/system/cpu/cpufreq/policy0/
+cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor
+cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_cur_freq
+```
+
+If the platform still refuses to hand P-state control to the OS, the next step is
+the ACPI `_PPC`/SMM handoff (`acpi_processor_pstate_control()` writes the FADT
+`PSTATE_CNT` value 0x80 to SMI port 0xB2); this is why `acpi=force` is on the
+command line.  Raw writes to `IA32_PERF_CTL` alone were verified insufficient
+on the old ACPI-disabled boot.
