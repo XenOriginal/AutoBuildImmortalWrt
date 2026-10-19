@@ -115,10 +115,26 @@ ab_env_path() {
     for p in $(ab_boot_layout_paths); do [ -f "$p" ] && { echo "$p"; return 0; }; done
     return 1
 }
-# 内核文件所在目录 (与 grub.cfg 同级)
+# 内核文件所在目录 (vmlinuz.a/vmlinuz.b 所在处)
+#
+# Two layouts are supported:
+#   A) env = /boot/grub/grubenv          -> kernel dir = /boot
+#   B) env = /boot/boot/grub/grubenv     -> kernel dir = /boot/boot
+# The old implementation returned the env directory (/boot/boot/grub), which
+# made ab-upgrade write vmlinuz.b next to grub.cfg instead of next to
+# vmlinuz.a.  Check for the actual kernel files to avoid that silent mismatch.
 ab_kernel_dir() {
-    local e; e=$(ab_env_path) || return 1
-    dirname "$e"
+    local e d p
+    e=$(ab_env_path) || return 1
+    d=$(dirname "$e")
+    if [ -f "$d/vmlinuz.a" ] || [ -f "$d/vmlinuz.b" ]; then
+        echo "$d"; return 0
+    fi
+    p=$(dirname "$d")
+    if [ -f "$p/vmlinuz.a" ] || [ -f "$p/vmlinuz.b" ]; then
+        echo "$p"; return 0
+    fi
+    echo "$d"
 }
 
 # ---------------------------------------------------------------------------
