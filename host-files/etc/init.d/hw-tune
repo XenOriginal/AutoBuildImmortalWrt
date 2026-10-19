@@ -1,0 +1,65 @@
+#!/bin/sh /etc/rc.common
+# ============================================================================
+# 运行期硬件/网络调优 (sysctl 覆盖不到的网卡级设置)
+#
+# 【为什么需要它】/etc/sysctl.conf 能调内核参数, 但网卡特性只能靠 ethtool。
+#   实测本机 mlx5(eth1) 与 ixgbe(eth2) 都支持 rx-udp-gro-forwarding 且默认关闭:
+#   打开后转发路径上的 UDP 报文可在收包侧合并, 对 PPPoE 上的 UDP/QUIC/游戏
+#   吞吐有正收益(社区常用开关)。
+#
+# 【配置】/etc/hw-tune.conf (可选):
+#   NIC_UDP_GRO=1            # 1=开启转发 UDP GRO (默认), 0=不动
+#   NIC_LIST="eth0 eth1 eth2"  # 默认自动扫描 eth*
+#   CPU_GOVERNOR=            # 留空=不干预 (默认 schedutil); 可填 performance
+#
+# 所有操作都是"尽力而为 + 可回退": 不支持的特性会跳过并记日志。
+# ============================================================================
+
+START=98
+STOP=2
+
+LOG=/etc/hw-tune.log
+CONF=/etc/hw-tune.conf
+
+log() { logger -t hw-tune "$1"; echo "$(date '+%F %T') $1" >> "$LOG"; }
+
+start() {
+    [ -f "$CONF" ] && . "$CONF"
+    NIC_UDP_GRO=${NIC_UDP_GRO:-1}
+    NIC_LIST=${NIC_LIST:-}
+
+    # 等网络接口就绪 (最多 60s)
+    n=0
+    while [ "$n" -lt 60 ]; do
+        ls /sys/class/net/eth* >/dev/null 2>&1 && break
+        sleep 3; n=$((n + 3))
+    done
+
+    if [ "$NIC_UDP_GRO" = 1 ] && command -v ethtool >/dev/null 2>&1; then
+        if [ -z "$NIC_LIST" ]; then
+            NIC_LIST=$(ls /sys/class/net/ | grep -E '^eth' | tr '\n' ' ')
+        fi
+        for i in $NIC_LIST; do
+            [ -e "/sys/class/net/$i" ] || continue
+            if ethtool -k "$i" 2>/dev/null | grep -q '^rx-udp-gro-forwarding:'; then
+                ethtool -K "$i" rx-udp-gro-forwarding on 2>/dev/null \
+                    && log "$i: rx-udp-gro-forwarding=on" \
+                    || log "$i: 开启失败(忽略)"
+            else
+                log "$i: 不支持 rx-udp-gro-forwarding, 跳过"
+            fi
+        done
+    fi
+
+    if [ -n "${CPU_GOVERNOR:-}" ] && [ -w /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor ]; then
+        old=$(cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor 2>/dev/null)
+        for f in /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor; do
+            [ -w "$f" ] && echo "$CPU_GOVERNOR" > "$f" 2>/dev/null
+        done
+        log "CPU governor: ${old} -> ${CPU_GOVERNOR}"
+    fi
+
+    log "调优完成"
+}
+
+stop() { :; }

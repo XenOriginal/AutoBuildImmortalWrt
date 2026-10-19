@@ -1,0 +1,220 @@
+#!/bin/sh
+# ============================================================================
+# LuCI A/B 固件管理与双槽升级 rpcd 后端插件
+# 挂载在 ubus 对象: luci.ab
+# ============================================================================
+
+. /lib/functions.sh
+. /usr/share/libubox/jshn.sh
+
+LOG_FILE="/tmp/ab-upgrade.log"
+STATUS_FILE="/tmp/ab-upgrade.status"
+PID_FILE="/tmp/ab-upgrade.pid"
+
+case "$1" in
+"list")
+	json_init
+	json_add_object "status"
+	json_close_object
+	json_add_object "switch"
+		json_add_string "target" "target"
+		json_add_boolean "permanent"
+		json_add_boolean "reboot"
+	json_close_object
+	json_add_object "bootok"
+	json_close_object
+	json_add_object "validate_image"
+		json_add_string "path" "path"
+	json_close_object
+	json_add_object "start_upgrade"
+		json_add_string "path" "path"
+		json_add_boolean "migrate"
+	json_close_object
+	json_add_object "upgrade_log"
+	json_close_object
+	json_add_object "reboot"
+	json_close_object
+	json_dump
+	json_cleanup
+	;;
+"call")
+	case "$2" in
+	"status")
+		if command -v ab-status >/dev/null 2>&1; then
+			ab-status --json 2>/dev/null || echo '{"is_ab":false,"error":"ab-status failed"}'
+		else
+			echo '{"is_ab":false,"error":"ab-status command not found"}'
+		fi
+		;;
+	"switch")
+		read -r input
+		json_load "$input"
+		json_get_var target "target"
+		json_get_var permanent "permanent"
+		json_get_var do_reboot "reboot"
+		json_cleanup
+
+		ARGS=""
+		[ -n "$target" ] && ARGS="$ARGS $target"
+		[ "$permanent" = "1" ] && ARGS="$ARGS --permanent"
+		[ "$do_reboot" = "1" ] && ARGS="$ARGS --reboot"
+		ARGS="$ARGS --yes"
+
+		out=$(eval ab-switch $ARGS 2>&1)
+		rc=$?
+		json_init
+		json_add_int "code" "$rc"
+		json_add_string "output" "$out"
+		json_dump
+		json_cleanup
+		;;
+	"bootok")
+		if command -v ab-bootok >/dev/null 2>&1; then
+			out=$(/etc/init.d/ab-bootok confirm 2>&1)
+			rc=$?
+		else
+			out="ab-bootok not found"
+			rc=1
+		fi
+		json_init
+		json_add_int "code" "$rc"
+		json_add_string "output" "$out"
+		json_dump
+		json_cleanup
+		;;
+	"validate_image")
+		read -r input
+		json_load "$input"
+		json_get_var imgpath "path"
+		json_cleanup
+
+		[ -z "$imgpath" ] && imgpath="/tmp/firmware.bin"
+
+		if [ ! -f "$imgpath" ]; then
+			json_init
+			json_add_boolean "valid" 0
+			json_add_string "message" "文件不存在: $imgpath"
+			json_dump
+			json_cleanup
+			exit 0
+		fi
+
+		# 检查是否为 gzip
+		chk_img="$imgpath"
+		need_clean=0
+		case "$imgpath" in
+			*.gz)
+				chk_img="/tmp/validate-header.img"
+				gzip -dc "$imgpath" | dd of="$chk_img" bs=1M count=32 2>/dev/null || true
+				need_clean=1
+				;;
+		esac
+
+		. /usr/lib/ab-lib.sh 2>/dev/null || true
+		info=""
+		if command -v ab_check_image >/dev/null 2>&1; then
+			info=$(ab_check_image "$chk_img" 2>/dev/null || true)
+		fi
+
+		[ "$need_clean" = 1 ] && rm -f "$chk_img"
+
+		fsize=$(stat -c%s "$imgpath" 2>/dev/null || echo 0)
+		md5=$(md5sum "$imgpath" 2>/dev/null | awk '{print $1}')
+		sha256=$(sha256sum "$imgpath" 2>/dev/null | awk '{print $1}')
+
+		json_init
+		if [ -n "$info" ]; then
+			json_add_boolean "valid" 1
+			json_add_int "size" "$fsize"
+			json_add_string "md5" "$md5"
+			json_add_string "sha256" "$sha256"
+			json_add_string "partitions" "$info"
+			json_add_string "message" "校验通过: 有效的 x86 Combined 固件镜像 (含 SquashFS rootfs)"
+		else
+			json_add_boolean "valid" 0
+			json_add_int "size" "$fsize"
+			json_add_string "md5" "$md5"
+			json_add_string "sha256" "$sha256"
+			json_add_string "message" "镜像结构异常: 未检测到合法的 x86 Combined 分区表或 SquashFS 标识"
+		fi
+		json_dump
+		json_cleanup
+		;;
+	"start_upgrade")
+		read -r input
+		json_load "$input"
+		json_get_var imgpath "path"
+		json_get_var migrate "migrate"
+		json_cleanup
+
+		[ -z "$imgpath" ] && imgpath="/tmp/firmware.bin"
+
+		if [ ! -f "$imgpath" ]; then
+			json_init
+			json_add_int "code" 1
+			json_add_string "error" "固件文件不存在"
+			json_dump
+			json_cleanup
+			exit 0
+		fi
+
+		# 检查当前是否有运行中的升级
+		if [ -f "$PID_FILE" ] && kill -0 "$(cat "$PID_FILE" 2>/dev/null)" 2>/dev/null; then
+			json_init
+			json_add_int "code" 2
+			json_add_string "error" "已有正在执行的升级任务"
+			json_dump
+			json_cleanup
+			exit 0
+		fi
+
+		rm -f "$LOG_FILE" "$STATUS_FILE"
+		echo "running" > "$STATUS_FILE"
+
+		UP_ARGS="--yes"
+		[ "$migrate" = "0" ] && UP_ARGS="$UP_ARGS --no-overlay"
+
+		# 后台执行并流式写入日志
+		(
+			echo "=== A/B 升级任务开始 $(date '+%Y-%m-%d %H:%M:%S') ===" >> "$LOG_FILE"
+			/usr/sbin/ab-upgrade "$imgpath" $UP_ARGS >> "$LOG_FILE" 2>&1
+			res=$?
+			if [ "$res" -eq 0 ]; then
+				echo "success" > "$STATUS_FILE"
+				echo "=== A/B 升级圆满完成 $(date '+%Y-%m-%d %H:%M:%S') ===" >> "$LOG_FILE"
+			else
+				echo "failed" > "$STATUS_FILE"
+				echo "=== A/B 升级失败 (退出码: $res) ===" >> "$LOG_FILE"
+			fi
+			rm -f "$PID_FILE"
+		) &
+		echo $! > "$PID_FILE"
+
+		json_init
+		json_add_int "code" 0
+		json_add_string "status" "started"
+		json_dump
+		json_cleanup
+		;;
+	"upgrade_log")
+		status="idle"
+		[ -f "$STATUS_FILE" ] && status=$(cat "$STATUS_FILE" 2>/dev/null)
+		log_content=""
+		[ -f "$LOG_FILE" ] && log_content=$(cat "$LOG_FILE" 2>/dev/null)
+
+		json_init
+		json_add_string "status" "$status"
+		json_add_string "log" "$log_content"
+		json_dump
+		json_cleanup
+		;;
+	"reboot")
+		( sleep 1; sync; reboot ) &
+		json_init
+		json_add_string "status" "rebooting"
+		json_dump
+		json_cleanup
+		;;
+	esac
+	;;
+esac

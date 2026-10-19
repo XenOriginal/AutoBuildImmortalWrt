@@ -1,0 +1,19 @@
+config global
+option anon_swap '0'
+option anon_mount '0'
+option auto_swap '0'
+option auto_mount '1'
+option delay_root '5'
+option check_fs '0'
+
+config mount
+option label 'kernel'
+option target '/boot'
+option options 'ro,noatime'
+option enabled '1'
+
+config mount
+option label 'LAGER2'
+option target '/Lager'
+option options 'barrier=1,commit=5,errors=remount-ro,noatime'
+option enabled '1'

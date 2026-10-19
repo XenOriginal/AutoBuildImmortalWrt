@@ -1,0 +1,37 @@
+#!/bin/sh /etc/rc.common
+# ==========================================================================
+# /etc/init.d/fsck-guard
+#
+#   S10：兜底钩子。真正拦住挂载的是 /etc/hotplug.d/block/00-fsck-guard。
+#
+#   为什么兜底还留着、且为什么不在 S 数字上做文章：
+#     实测（2026-10-18 重启）发现 /Lager 是 block 热插拔链挂的——
+#       /etc/hotplug.d/block/10-mount -> /sbin/block hotplug
+#     它在 rcS 之前（约 22s）就挂好了 /Lager、/mnt/sda1，所以任何 S 数字
+#     都晚了一步。顺序改由 hotplug 钩子按文件名（00 早于 10/15）保证。
+#     本钩子只在此条件下生效：本次开机没收到 block 事件（钩子没跑），
+#     此时 fsck 仍早于 S11fstab 与 S99dockerd，属于合理兜底。
+#     正常开机它会看到 /tmp/.fsck-guard-done 后立刻返回，不产生额外开销。
+#
+#   逻辑全在 /usr/local/bin/fsck-guard（由 wrtpatch 统一安装/升级）。
+# ==========================================================================
+START=10
+
+boot() {
+	start
+}
+
+start() {
+	[ -x /usr/local/bin/fsck-guard ] || {
+		echo "fsck-guard: /usr/local/bin/fsck-guard 不存在，跳过"
+		return 0
+	}
+	/usr/local/bin/fsck-guard boot
+	# 即使修不好也不让开机链中断：/Lager 挂载失败会在 S11 暴露，
+	# 日志留在 /root/wrtpatch/state/fsck.log 供事后处理。
+	return 0
+}
+
+stop() {
+	return 0
+}

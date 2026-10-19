@@ -1,0 +1,869 @@
+#!/bin/sh
+# ==========================================================================
+# nfs-guard — NAS NFS 挂载 / IP 守护 / 关机卸载 一体化脚本
+#
+# 合并自（原三个散装脚本）:
+#   /usr/local/bin/nfs-mounts.sh      开机挂载
+#   /usr/local/bin/nfs-ip-watchdog.sh NAS IP 变化重挂(cron 每 2 分钟)
+#   (缺失)                            关机卸载 -> 见 umount
+#
+# 调用方:
+#   /etc/init.d/nfs-guard        S97 -> mount      K86 -> umount
+#   /etc/init.d/nfs-bootwait     S99 -> bootwait（后台补齐挂载 + 拉起容器）
+#   /etc/init.d/nfs-guard-start  S99 -> restore
+#   cron                         */2 -> watch
+#   人工                         nfs-guard status | doctor
+#
+# 【v3 修正的三件事】
+#   1) 关机卡死：NFS 仍挂载时不能 sync。hard 挂载在服务端失联后写回永不返回，
+#      sync/umount 会进入 D 状态，procd 等不到 K 脚本退出 -> 重启永远完不成。
+#      现在：服务端可达才刷脏页；umount 全部有界；presync 让 K90umount 跳过 sync。
+#   2) 关机残留：umount 前先清掉占用 NFS 的进程（cwd/fd），否则只能惰性摘除，
+#      留下活着的 superblock，后面的全局 sync 照样会踩上去卡死。
+#   3) 开机太慢：NAS 比路由器晚几分钟上线时，原来要等 3 分钟才有容器。
+#      现在 S97 只做快速尝试，bootwait 后台每 8 秒探测，NAS 一上线立刻挂载+起容器。
+#
+# 【硬性顺序（两条链，不能颠倒）】
+#   开机:  ping NAS 连续 3 次可达(链路稳定) -> mount NFS -> 全部挂载点就位 -> 起容器
+#          容器绝不在挂载不完整时启动（否则会把 overlay 空目录当数据盘）
+#   关机:  K60 停容器 -> K86 等 NFS 脏页同步落盘 -> 逐级卸载 NFS -> K90 断网
+#          断网一定发生在 NFS 卸载之后，因此不会再出现 not responding 卡死
+#
+# 【v3.2 关键约束：procd 给每个 K 脚本只有 15 秒】
+#   procd/rcS.c:
+#       if (!strcmp(param,"stop") || !strcmp(param,"shutdown")) {
+#               s->proc.task.run_timeout    = 15000;   <- 15s 后 SIGTERM
+#               s->proc.task.cancel_timeout = 10000;   <- 再 10s SIGKILL
+#       }
+#   即：任何 K 脚本超过 15 秒就会被杀掉，后面的步骤根本不会执行。
+#   之前的失败正是这个原因：K86 里跑 docker stop -t 20，第 15 秒被切断，
+#   NFS 一个都没卸掉，于是 K90network 断网 + K90umount 的 sync -> 永久卡死。
+#   所以关机动作必须拆成两个钩子，每个都远低于 15 秒：
+#       K60nfs-guard-dockstop  停容器（-t 6，超时强收，预算 ~11s）
+#       K86nfs-guard           sync(<=3s) + 并发优雅卸载(<=3s) + 兜底 force/lazy
+#   另有一个脱离会话的看门狗（setsid），万一仍有步骤卡死也能强制中断。
+# ==========================================================================
+VERSION="3.3.0"
+
+NAS_IP_DEFAULT="10.0.0.10"
+NAS_MAC="10:90:27:e8:6c:2b"
+# 开机首轮等待上限(秒)。故意很短：不阻塞启动，剩余工作交给 bootwait。
+WAIT="${NFS_WAIT:-20}"
+RETRY="${NFS_RETRY:-3}"
+# bootwait 最长守候时间(秒)。NAS 冷启动通常 3-5 分钟。
+BOOT_WAIT_MAX="${NFS_BOOT_WAIT_MAX:-900}"
+# 关机看门狗：钩子起算多少秒仍未完成就强制中断（0=关闭）。
+# 正常整个关机链 15~25 秒，40 秒还没走完说明卡死了。
+WATCHDOG_AFTER="${NFS_WATCHDOG_AFTER:-40}"
+# 停容器的优雅窗口与预算（必须给 K86 留够时间，procd 每脚本只有 15s）
+STOP_GRACE="${NFS_STOP_GRACE:-6}"
+STOP_BUDGET="${NFS_STOP_BUDGET:-9}"
+# 关机刷脏页的上限
+SYNC_BUDGET="${NFS_SYNC_BUDGET:-3}"
+OPTS="vers=3,proto=tcp,timeo=200,retrans=2,nolock"
+
+# 远端路径:本地挂载点:附加选项
+DEFAULT_SHARES="
+/volume2/Lager/Surveillance:/nfs/Surveillance:
+/volume2/Lager/Media:/mnt/nas-media:ro,
+"
+# 可用 NFS_SHARES 覆盖（自测/临时挂载用）
+SHARES="${NFS_SHARES:-$DEFAULT_SHARES}"
+
+CUR_IP_FILE="/tmp/nfs-cur-ip"
+STATUS_FILE="/tmp/nfs-status"
+LOG="/tmp/nfs-guard.log"
+STOP_FLAG="/tmp/.nfs-guard-stop"
+STATE_DIR="/root/wrtpatch/state"
+LAST_LIST="$STATE_DIR/containers.last"
+LIST_TMP="$STATE_DIR/containers.last.tmp"
+SLOG_FILE="$STATE_DIR/shutdown.log"
+BLOG_FILE="$STATE_DIR/boot.log"
+
+log() {
+	echo "$(date '+%F %T') $*" >>"$LOG"
+	logger -t nfs-guard -p daemon.info -- "$*" 2>/dev/null || true
+}
+
+# 持久化日志：/tmp 是 tmpfs，重启即丢；关机过程必须留证据到 flash
+_rotate() { # $1=文件
+	[ -f "$1" ] || return 0
+	_sz=$(wc -c <"$1" 2>/dev/null)
+	[ -n "$_sz" ] && [ "$_sz" -gt 131072 ] && mv -f "$1" "$1.old"
+	return 0
+}
+
+slog() {
+	_m="nfs-guard: $*"
+	mkdir -p "$STATE_DIR" 2>/dev/null
+	_rotate "$SLOG_FILE"
+	echo "$(date '+%F %T') $*" >>"$SLOG_FILE" 2>/dev/null
+	[ -e /dev/console ] && echo "$_m" >/dev/console 2>/dev/null
+	echo "$_m" >/dev/kmsg 2>/dev/null
+	log "$*"
+}
+
+blog() {
+	_rotate "$BLOG_FILE"
+	mkdir -p "$STATE_DIR" 2>/dev/null
+	echo "$(date '+%F %T') $*" >>"$BLOG_FILE" 2>/dev/null
+	log "$*"
+}
+
+is_nfs() {
+	awk -v t="$1" '$2==t && ($3=="nfs"||$3=="nfs4"){f=1} END{exit !f}' /proc/mounts
+}
+
+nfs_count() {
+	awk '$3=="nfs"||$3=="nfs4"{c++} END{print c+0}' /proc/mounts
+}
+
+# 清单里的挂载点是否全部就位。
+# 只判断"有挂载"是不够的：部分挂载时容器会把空目录当数据盘，写进 overlay。
+nfs_complete() {
+	while IFS=: read -r _r _l _e; do
+		[ -z "$_l" ] && continue
+		is_nfs "$_l" || return 1
+	done <<EOF
+$SHARES
+EOF
+	return 0
+}
+
+missing_shares() {
+	while IFS=: read -r _r _l _e; do
+		[ -z "$_l" ] && continue
+		is_nfs "$_l" || printf '%s ' "$_l"
+	done <<EOF
+$SHARES
+EOF
+}
+
+nas_reachable() {
+	[ -n "$1" ] || return 1
+	ping -c 1 -W 2 "$1" >/dev/null 2>&1
+}
+
+# 快速探测(1 秒超时)：bootwait / watch 高频调用，不能用 2 秒超时
+probe_nas() {
+	for _c in "$NAS_IP_DEFAULT" $(grep -i "$NAS_MAC" /tmp/dhcp.leases 2>/dev/null | awk '{print $3}'); do
+		[ -n "$_c" ] || continue
+		ping -c 1 -W 1 "$_c" >/dev/null 2>&1 && { echo "$_c"; return 0; }
+	done
+	return 1
+}
+
+# ------------------------------------------------------------------ 链路
+# 刚上电时 NAS 可能"能 ping 通一下"就又掉了（网卡协商/DHCP 续租/服务未起）。
+# 必须连续 N 次 ping 通才算链路稳定，稳定之后才允许 mount —— 否则会挂上一个
+# 半死不活的 NFS，后续所有读写都要卡 timeo。
+LINK_STABLE_N="${NFS_LINK_STABLE:-3}"
+LINK_STABLE_GAP="${NFS_LINK_GAP:-2}"
+
+link_stable() { # $1=ip $2=最长等待秒
+	_ip="$1"
+	_dl=$(($(date +%s) + ${2:-45}))
+	_ok=0
+	while :; do
+		if ping -c 1 -W 1 "$_ip" >/dev/null 2>&1; then
+			_ok=$((_ok + 1))
+		else
+			_ok=0
+		fi
+		[ "$_ok" -ge "$LINK_STABLE_N" ] && return 0
+		[ "$(date +%s)" -ge "$_dl" ] && return 1
+		sleep "$LINK_STABLE_GAP"
+	done
+}
+
+# ------------------------------------------------------------------ 挂载
+resolve_ip() {
+	_deadline=$(($(date +%s) + WAIT))
+	while :; do
+		_ip="$(probe_nas)"
+		[ -n "$_ip" ] && { echo "$_ip"; return 0; }
+		[ "$(date +%s)" -ge "$_deadline" ] && return 1
+		sleep 2
+	done
+}
+
+mount_one() { # $1=ip $2=remote $3=local $4=extra
+	_ip="$1"; _rmt="$2"; _lcl="$3"; _ext="$4"
+	if is_nfs "$_lcl"; then return 0; fi
+	mkdir -p "$_lcl"
+	_n=0
+	while [ "$_n" -lt "$RETRY" ]; do
+		if mount -t nfs -o "${_ext}${OPTS}" "$_ip:$_rmt" "$_lcl" 2>/dev/null; then
+			blog "ok   $_lcl <- $_ip:$_rmt"
+			return 0
+		fi
+		_n=$((_n + 1))
+		[ "$_n" -lt "$RETRY" ] && sleep 3
+	done
+	blog "FAIL $_lcl <- $_ip:$_rmt (${RETRY} 次均失败)"
+	return 1
+}
+
+cmd_mount() {
+	_ip="$1"
+	# 开机路径顺便清掉上一次 poweroff 留下的持久标记，
+	# 避免"上次没断成电"的陈旧标记让本次重启被误判成 poweroff
+	[ "${NFS_SHUTDOWN:-0}" != "1" ] && rm -f "$STATE_DIR/poweroff.flag" "$STATE_DIR/shutdown.done" 2>/dev/null
+	if nfs_complete; then
+		[ -n "$_ip" ] && echo "$_ip" >"$CUR_IP_FILE"
+		log "skip mount (全部已挂载)"
+		return 0
+	fi
+	[ -z "$_ip" ] && _ip="$(resolve_ip)"
+	if [ -z "$_ip" ]; then
+		blog "NAS 未上线(${WAIT}s 内)，本轮放弃（交给 bootwait/watch 继续重试）"
+		echo "fail nas-offline $(date +%s)" >"$STATUS_FILE"
+		return 1
+	fi
+
+	# 先确认链路稳定，再建立 NFS —— 顺序不能反
+	if ! link_stable "$_ip" "$WAIT"; then
+		blog "链路未稳定($_ip)，本轮不挂载（避免挂上时好时坏的 NFS）"
+		echo "fail link-unstable $(date +%s)" >"$STATUS_FILE"
+		return 1
+	fi
+	blog "链路稳定($_ip 连续 ${LINK_STABLE_N} 次可达)，开始建立 NFS"
+
+	_rc=0
+	while IFS=: read -r _rmt _lcl _ext; do
+		[ -z "$_lcl" ] && continue
+		mount_one "$_ip" "$_rmt" "$_lcl" "$_ext" || _rc=1
+	done <<EOF
+$SHARES
+EOF
+
+	echo "$_ip" >"$CUR_IP_FILE"
+	if [ "$_rc" -eq 0 ]; then
+		echo "ok $_ip $(date +%s)" >"$STATUS_FILE"
+		blog "mount done ($_ip, $(nfs_count) 个)"
+	else
+		echo "partial $_ip $(date +%s)" >"$STATUS_FILE"
+		blog "mount partial ($_ip)，缺: $(missing_shares)"
+	fi
+	return "$_rc"
+}
+
+# ------------------------------------------------------------------ 卸载
+# 有界 umount: 后台执行 + 轮询 /proc/mounts，超时即放手，绝不等死
+umount_bounded() { # $1=mp $2=secs [flags...]
+	_mp="$1"; _to="$2"; shift 2
+	umount "$@" "$_mp" >/dev/null 2>&1 &
+	_i=0
+	while [ "$_i" -lt "$_to" ]; do
+		is_nfs "$_mp" || return 0
+		sleep 1
+		_i=$((_i + 1))
+	done
+	slog "超时        $_mp ($* ${_to}s 未返回)"
+	return 1
+}
+
+# 服务端可达: 先优雅卸载（数据能正常回写）。超时必须极短 —— K86 总共只有 15s
+umount_one() {
+	_mp="$1"
+	is_nfs "$_mp" || return 0
+	if umount_bounded "$_mp" 2; then slog "ok/graceful $_mp"; return 0; fi
+	if umount_bounded "$_mp" 1 -f; then slog "ok/force    $_mp"; return 0; fi
+	if umount -l "$_mp" >/dev/null 2>&1; then slog "ok/lazy     $_mp"; return 0; fi
+	slog "FAIL        $_mp"
+	return 1
+}
+
+# 服务端不可达 / 已经出现过卡顿: 直接 -f / -l，不做会阻塞的优雅卸载
+umount_fast() {
+	_mp="$1"
+	is_nfs "$_mp" || return 0
+	if umount_bounded "$_mp" 1 -f; then slog "ok/force    $_mp"; return 0; fi
+	if umount -l "$_mp" >/dev/null 2>&1; then slog "ok/lazy     $_mp"; return 0; fi
+	slog "FAIL        $_mp"
+	return 1
+}
+
+# 清单内的 nfs 挂载数（定向测试时只算清单，不受其它 nfs 挂载干扰）
+list_nfs_count() {
+	_n=0
+	while IFS=: read -r _r _l _e; do
+		[ -z "$_l" ] && continue
+		is_nfs "$_l" && _n=$((_n + 1))
+	done <<EOF
+$SHARES
+EOF
+	echo "$_n"
+}
+
+# 并发优雅卸载清单内全部挂载，整体上限 $1 秒。
+# 6 个挂载串行优雅卸载最坏要 6x2s=12s，直接爆掉 15s 预算，所以必须并发。
+umount_all_graceful() {
+	_to="$1"
+	: >/tmp/.nfsg-mps
+	while IFS=: read -r _r _l _e; do
+		[ -z "$_l" ] && continue
+		is_nfs "$_l" && echo "$_l" >>/tmp/.nfsg-mps
+	done <<EOF
+$SHARES
+EOF
+	[ -s /tmp/.nfsg-mps ] || return 0
+	while read -r _mp; do
+		umount "$_mp" >/dev/null 2>&1 &
+	done </tmp/.nfsg-mps
+	_i=0
+	while [ "$_i" -lt "$_to" ]; do
+		[ "$(list_nfs_count)" -eq 0 ] && return 0
+		sleep 1
+		_i=$((_i + 1))
+	done
+	return 1
+}
+
+# umount 前清掉占用 NFS 的进程（cwd / 打开的 fd）。
+# 不清理就只能惰性摘除，superblock 仍然活着，后面的全局 sync 会踩上去永久阻塞。
+kill_nfs_holders() {
+	_hit=""
+	for _p in /proc/[0-9]*; do
+		_pid="${_p#/proc/}"
+		[ "$_pid" = "$$" ] && continue
+		[ "$_pid" = "1" ] && continue
+		[ -d "$_p" ] || continue
+		_nm=$(cat "$_p/comm" 2>/dev/null)
+		_t=$(readlink "$_p/cwd" 2>/dev/null)
+		case "$_t" in
+			/nfs/*|/mnt/nas*) _hit="$_hit $_pid($_nm)cwd";;
+		esac
+		for _fd in "$_p"/fd/*; do
+			_t=$(readlink "$_fd" 2>/dev/null)
+			case "$_t" in
+				/nfs/*|/mnt/nas*) _hit="$_hit $_pid($_nm)fd"; break;;
+			esac
+		done
+	done
+	if [ -z "$_hit" ]; then
+		slog "占用 NFS 的进程: 无"
+		return 0
+	fi
+	slog "占用 NFS 的进程:$_hit"
+	for _e in $_hit; do
+		kill -TERM "${_e%%(*}" 2>/dev/null
+	done
+	sleep 1
+	for _e in $_hit; do
+		_pid="${_e%%(*}"
+		if kill -0 "$_pid" 2>/dev/null; then
+			kill -KILL "$_pid" 2>/dev/null && slog "已强杀 $_pid"
+		fi
+	done
+}
+
+# 关机时停容器: 容器 namespace 里持有 NFS 挂载, 不停就 EBUSY
+# 【预算】procd 给 K 脚本只有 15s，所以这里最多花 STOP_BUDGET(9s)：
+#   优雅 docker stop -t 6 跑不完就 docker kill 强收（约 1s）。
+#   宁可丢容器最后几秒的缓存，也不能让关机卡在这里。
+stop_containers() {
+	if [ "${NFS_SKIP_DOCKER:-0}" = "1" ]; then
+		log "NFS_SKIP_DOCKER=1，跳过停容器"
+		return 0
+	fi
+	docker info >/dev/null 2>&1 || { slog "docker 不可用，跳过停容器"; return 0; }
+	_ids="$(docker ps -q 2>/dev/null)"
+	[ -z "$_ids" ] && { slog "无运行容器"; return 0; }
+
+	# 记录"关机前在跑"的容器。restart=unless-stopped 的容器被 docker stop 后
+	# 不会随守护进程启动而恢复，必须开机时按这份名单显式拉起。
+	mkdir -p "$STATE_DIR"
+	docker ps --format '{{.Names}}' >"$LAST_LIST" 2>/dev/null
+	slog "记录 $(wc -l <"$LAST_LIST" 2>/dev/null) 个运行中容器 -> $LAST_LIST"
+
+	slog "停止 $(printf '%s\n' "$_ids" | wc -l) 个容器（-t ${STOP_GRACE}s，预算 ${STOP_BUDGET}s）"
+	rm -f /tmp/.nfsguard-dockerstop.done
+	# 阻塞操作放子 shell，主流程只轮询标记文件，docker API 卡住也不会拖死关机
+	(
+		# shellcheck disable=SC2086
+		docker stop -t "$STOP_GRACE" $_ids >/dev/null 2>&1
+		touch /tmp/.nfsguard-dockerstop.done
+	) &
+	_i=0
+	while [ "$_i" -lt "$STOP_BUDGET" ]; do
+		[ -f /tmp/.nfsguard-dockerstop.done ] && { slog "容器已全部停止（${_i}s）"; return 0; }
+		sleep 1
+		_i=$((_i + 1))
+	done
+
+	# 超时：强收。不这么做，NFS 就永远 EBUSY，只能惰性摘除（脏 superblock）
+	slog "停止超时 ${STOP_BUDGET}s，改用 docker kill 强收"
+	_r="$(docker ps -q 2>/dev/null)"
+	[ -n "$_r" ] && docker kill $_r >/dev/null 2>&1
+	_i=0
+	while [ "$_i" -lt 3 ]; do
+		[ -z "$(docker ps -q 2>/dev/null)" ] && break
+		sleep 1
+		_i=$((_i + 1))
+	done
+	slog "强收结束，仍在运行 $(docker ps -q 2>/dev/null | wc -l) 个"
+	return 0
+}
+
+# 关机看门狗：无论卡在哪一步，"重启"都必须能完成。
+# 必须 setsid 脱离会话 —— K 脚本被 procd 杀掉时，看门狗要能活下来继续收尾。
+arm_watchdog() {
+	[ "${WATCHDOG_AFTER:-0}" -le 0 ] 2>/dev/null && return 0
+	[ -f /tmp/.nfsguard-wd-armed ] && return 0
+	_ss=""
+	[ -x /usr/bin/setsid ] && _ss="/usr/bin/setsid"
+	[ -z "$_ss" ] && busybox --list 2>/dev/null | grep -qx setsid && _ss="busybox setsid"
+	[ -z "$_ss" ] && { slog "无 setsid，看门狗未布防"; return 0; }
+	$_ss /bin/sh -c "NFS_WATCHDOG_AFTER=$WATCHDOG_AFTER /usr/local/bin/nfs-guard watchdog" >/dev/null 2>&1 &
+	touch /tmp/.nfsguard-wd-armed
+	slog "已布防关机看门狗（${WATCHDOG_AFTER}s 未完成则强制中断）"
+}
+
+cmd_watchdog() {
+	sleep "${WATCHDOG_AFTER:-40}"
+	# 正常收尾会写 done 标志；有它说明关机链走完了，看门狗必须收手
+	# （否则手动中止一次测试后就可能被自己的看门狗强制重启）
+	if [ -f "$STATE_DIR/shutdown.done" ]; then
+		return 0
+	fi
+	# 还活着 => 关机链没有走完
+	slog "看门狗: 关机已 ${WATCHDOG_AFTER}s 未完成，强制中断"
+	if [ "${NFS_WATCHDOG_DRYRUN:-0}" = "1" ]; then
+		slog "[dry-run] 不执行强制动作"
+		return 0
+	fi
+	if [ -f /tmp/.poweroff-requested ] || [ -f "$STATE_DIR/poweroff.flag" ]; then
+		# 本次是 poweroff：ACPI 失效只能写 S5，连试 3 次
+		_n=0
+		while [ "$_n" -lt 3 ]; do
+			_n=$((_n + 1))
+			slog "看门狗: 第 ${_n} 次写 S5"
+			[ -x /usr/local/bin/powerguard ] && POWERGUARD_FORCE=1 /usr/local/bin/powerguard fallback
+			sleep 2
+		done
+		echo 1 >/proc/sys/kernel/sysrq 2>/dev/null
+		echo o >/proc/sysrq-trigger 2>/dev/null
+		sleep 3
+		# poweroff 场景绝不 sysrq-b：把机器重新点亮比停住更糟
+		slog "看门狗: S5 未生效，保持 halt（数据已落盘）"
+		return 0
+	fi
+	echo 1 >/proc/sys/kernel/sysrq 2>/dev/null
+	echo b >/proc/sysrq-trigger 2>/dev/null
+	# 万一 sysrq 也被禁，退化为普通重启
+	[ -x /sbin/reboot ] && /sbin/reboot -f
+}
+
+# 停机第 1 步（K60nfs-guard-dockstop）: 只停容器，独立吃掉一个 15s 预算。
+# 这样 K86 才有足够时间做"同步 + 卸载"，不会两步挤在同一个 15s 里被腰斩。
+cmd_dockstop() {
+	touch "$STOP_FLAG"
+	mkdir -p "$STATE_DIR"
+	if [ "${NFS_SHUTDOWN:-0}" = "1" ]; then
+		rm -f "$STATE_DIR/shutdown.done"   # 新一轮关机，清掉上一轮的收尾标志
+		slog "======== 停机第1步：停止容器（nfs=$(nfs_count) 个）========"
+		arm_watchdog
+	fi
+	stop_containers
+	return 0
+}
+
+# 停机第 2 步（K86nfs-guard）: 清占用 -> 有界刷脏页 -> 并发优雅卸载 -> 兜底 force/lazy
+cmd_umount() {
+	# 关机期间禁止 bootwait / cron watch 重新挂载
+	touch "$STOP_FLAG"
+	: >"$LOG"
+	_ip="${1:-$(cat "$CUR_IP_FILE" 2>/dev/null)}"
+	[ -z "$_ip" ] && _ip="$NAS_IP_DEFAULT"
+
+	slog "======== 停机第2步：卸载 NFS (nas=$_ip, nfs=$(nfs_count) 个) ========"
+	[ "${NFS_SHUTDOWN:-0}" = "1" ] && arm_watchdog
+
+	# 容器本应在 K60 已停完；这里只做兜底确认，绝不长时间阻塞
+	if [ "${NFS_SKIP_DOCKER:-0}" != "1" ] && docker info >/dev/null 2>&1; then
+		_r="$(docker ps -q 2>/dev/null)"
+		if [ -n "$_r" ]; then
+			slog "仍有 $(printf '%s\n' "$_r" | wc -l) 个容器在跑（K60 未收干净），强收"
+			# shellcheck disable=SC2086
+			docker kill $_r >/dev/null 2>&1
+			sleep 1
+		fi
+	fi
+
+	kill_nfs_holders
+
+	_reach=0
+	nas_reachable "$_ip" && _reach=1
+
+	# 关键: 服务端可达时先把脏页刷干净（容器停了，这一步通常 1s 内完成）。
+	# 否则 umount 会卡在 sync_filesystem，既卸不掉又留下活着的 superblock。
+	if [ "$_reach" = "1" ]; then
+		slog "NAS 可达，刷 NFS 脏页（上限 ${SYNC_BUDGET}s）"
+		( sync ) &
+		_sp=$!
+		_i=0
+		_synced=0
+		while [ "$_i" -lt "$SYNC_BUDGET" ]; do
+			kill -0 "$_sp" 2>/dev/null || { _synced=1; break; }
+			sleep 1
+			_i=$((_i + 1))
+		done
+		[ "$_synced" = "1" ] && slog "同步完成（${_i}s）" || slog "同步未完成（${SYNC_BUDGET}s），直接走强制卸载"
+	else
+		slog "NAS 不可达，跳过同步，直接强制/惰性卸载（可能有未落盘数据）"
+	fi
+
+	# 并发优雅卸载：6 个挂载串行最坏要 12s，会爆掉 15s 预算
+	_n0=$(list_nfs_count)
+	if [ "$_reach" = "1" ] && [ "$_n0" -gt 0 ]; then
+		if umount_all_graceful 3; then
+			slog "优雅卸载完成：$_n0 个，0 残留"
+			_n1=0
+		else
+			_n1=$(list_nfs_count)
+			slog "优雅卸载后仍有 $_n1 个残留，转强制/惰性"
+		fi
+	else
+		_n1="$_n0"
+	fi
+
+	# 兜底：残留的一个个来，force 1s -> lazy（不会阻塞）
+	if [ "${_n1:-0}" -gt 0 ]; then
+		while IFS=: read -r _rmt _lcl _ext; do
+			[ -z "$_lcl" ] && continue
+			is_nfs "$_lcl" || continue
+			umount_fast "$_lcl"
+		done <<EOF
+$SHARES
+EOF
+	fi
+
+	# 清单之外的 nfs 挂载一律惰性摘除（定向操作时不扫，避免误伤测试挂载）
+	if [ -z "${NFS_SHARES:-}" ]; then
+		for _mp in $(awk '$3=="nfs"||$3=="nfs4"{print $2}' /proc/mounts); do
+			is_nfs "$_mp" || continue
+			umount -l "$_mp" >/dev/null 2>&1 && slog "ok/lazy(清理) $_mp"
+		done
+	fi
+
+	_left=$(nfs_count)
+	if [ "$_left" -eq 0 ]; then
+		slog "======== 关机卸载完成：0 个残留 ========"
+		echo "clean $(date +%s)" >"$STATE_DIR/shutdown.state"
+	else
+		slog "======== 警告：仍有 $_left 个残留（已惰性摘除，superblock 可能未释放）========"
+		echo "leftover $_left $(date +%s)" >"$STATE_DIR/shutdown.state"
+	fi
+	# 注意：这里**不能**解除看门狗。K86 只代表 NFS 卸完了，
+	# 后面还有 K90network / K90umount / K98。2026-10-18 01:31 实测就是
+	# K90umount 之后整条链停住，而看门狗早在 K86 就被这个标志解除了，
+	# 于是没人兜底 -> 只能拔电。现在改由 K98 在走完关机链后再解除。
+	log "umount done (left=$_left)"
+	return 0
+}
+
+# 给 /etc/init.d/umount 用：返回 0 表示可以安全 sync
+cmd_presync() {
+	_n=$(nfs_count)
+	if [ "$_n" -eq 0 ]; then
+		echo "$(date '+%F %T') presync: 无 NFS 挂载，允许全局 sync" >>"$SLOG_FILE" 2>/dev/null
+		return 0
+	fi
+	slog "presync: 仍有 $_n 个 NFS 挂载，跳过全局 sync（会永久阻塞）"
+	echo "umount: 仍有 $_n 个 NFS 挂载，跳过全局 sync（避免永久阻塞）" >/dev/console 2>/dev/null
+	return 1
+}
+
+# ------------------------------------------------------------------ 守护
+# 按关机前记录的名单把容器拉起来。前提: 挂载点全部就位，否则会把空目录当数据盘。
+cmd_restore() {
+	[ -f "$LAST_LIST" ] || { blog "restore: 无容器名单，转 heal"; cmd_heal; return 0; }
+	if ! nfs_complete; then
+		blog "restore: NFS 未完整挂载(缺: $(missing_shares))，拒绝启动容器"
+		return 1
+	fi
+	if ! docker info >/dev/null 2>&1; then
+		_t=0
+		while [ "$_t" -lt 30 ]; do
+			sleep 1
+			_t=$((_t + 1))
+			docker info >/dev/null 2>&1 && break
+		done
+	fi
+	docker info >/dev/null 2>&1 || { blog "restore: dockerd 未就绪"; return 1; }
+
+	_ok=0; _bad=0; _skip=0
+	while read -r _c; do
+		[ -z "$_c" ] && continue
+		docker inspect "$_c" >/dev/null 2>&1 || { _skip=$((_skip + 1)); continue; }
+		[ "$(docker inspect -f '{{.State.Running}}' "$_c" 2>/dev/null)" = "true" ] && continue
+		if docker start "$_c" >/dev/null 2>&1; then
+			_ok=$((_ok + 1))
+			blog "restore: started $_c"
+		else
+			_bad=$((_bad + 1))
+			blog "restore: FAILED $_c"
+		fi
+	done <"$LAST_LIST"
+	if [ "$_ok" -gt 0 ] || [ "$_bad" -gt 0 ]; then
+		blog "restore: 启动 $_ok 个, 失败 $_bad 个, 跳过缺失 $_skip 个"
+	fi
+	cmd_heal
+	[ "$_bad" -gt 0 ] && return 1
+	return 0
+}
+
+# 补起"被 dockerd 抢先拉起、因 NFS 未就绪而创建失败"的容器
+# ------------------------------------------------------------------
+# 场景（deepseek-harness 踩过的坑）：
+#   dockerd 在 S99 启动时，会立刻按 unless-stopped 把所有容器拉起来，
+#   而 NFS 可能还没挂上 -> 绑定源 /nfs/... 是 overlay 上的空目录 ->
+#   入口脚本不存在 -> runc create 失败 -> ExitCode 127。
+#   这类容器不一定是"关机前在跑"的（可能上一次开机就已经死了），
+#   所以不在 containers.last 里，restore 不会管它，于是一直躺着。
+#
+# 判据（三条同时满足，避免误拉用户手动停掉的容器）：
+#   1) 挂载源落在 NFS 上
+#   2) 策略不是 no
+#   3) State.Error 是"创建阶段失败"——正常退出或手动停止时该字段为空
+cmd_heal() {
+	nfs_complete || { blog "heal: NFS 未完整挂载，跳过"; return 1; }
+	docker info >/dev/null 2>&1 || return 1
+
+	_all="$(docker ps -aq 2>/dev/null)"
+	[ -z "$_all" ] && return 0
+
+	_n=0
+	# 一次性取回全部状态，避免 N 次 docker inspect（开机阶段慢）
+	# shellcheck disable=SC2086
+	while IFS='|' read -r _nm _pol _run _err _mnts; do
+		_c="${_nm#/}"
+		[ -z "$_c" ] && continue
+		[ "$_run" = "true" ] && continue
+		[ "$_pol" = "no" ] && continue
+		case "$_err" in
+			*"runc create failed"*|*"failed to create task"*|*"no such file or directory"*|*"executable file not found"*|*"permission denied"*) ;;
+			*) continue ;;
+		esac
+		case ",$_mnts" in
+			*,/nfs/*|*,/mnt/nas/*) ;;
+			*) continue ;;
+		esac
+		if docker start "$_c" >/dev/null 2>&1; then
+			sleep 2
+			if [ "$(docker inspect -f '{{.State.Running}}' "$_c" 2>/dev/null)" = "true" ]; then
+				_n=$((_n + 1))
+				blog "heal: 补起 $_c（NFS 就绪后重建成功）"
+				if [ -f "$LAST_LIST" ] && ! grep -qx "$_c" "$LAST_LIST" 2>/dev/null; then
+					echo "$_c" >>"$LAST_LIST"
+				fi
+			else
+				blog "heal: $_c 启动后立即退出(exit=$(docker inspect -f '{{.State.ExitCode}}' "$_c" 2>/dev/null))"
+			fi
+		else
+			blog "heal: FAILED $_c"
+		fi
+	done <<EOF
+$(docker inspect --format '{{.Name}}|{{.HostConfig.RestartPolicy.Name}}|{{.State.Running}}|{{.State.Error}}|{{range .Mounts}}{{.Source}},{{end}}' $_all 2>/dev/null)
+EOF
+	[ "$_n" -gt 0 ] && blog "heal: 共补起 $_n 个容器"
+	return 0
+}
+
+# 开机后台补齐：NAS 比路由器晚上线时，不用等 cron 的 2 分钟周期
+cmd_bootwait() {
+	[ -f "$STOP_FLAG" ] && { blog "bootwait: 系统在关机，退出"; return 0; }
+	blog "bootwait 启动（最长 ${BOOT_WAIT_MAX}s，每 8s 探测）"
+	_deadline=$(($(date +%s) + BOOT_WAIT_MAX))
+	_tries=0
+	_waited=0
+	while :; do
+		[ -f "$STOP_FLAG" ] && { blog "bootwait: 系统在关机，退出"; return 0; }
+
+		if ! nfs_complete; then
+			_ip="$(probe_nas)"
+			if [ -n "$_ip" ]; then
+				echo "$_ip" >"$CUR_IP_FILE"
+				NFS_RETRY=1 cmd_mount "$_ip" >/dev/null 2>&1
+			elif [ "$_waited" -eq 0 ]; then
+				blog "bootwait: NAS 尚未上线，继续等待"
+				_waited=1
+			fi
+		fi
+
+		if nfs_complete; then
+			if cmd_restore; then
+				blog "bootwait: NFS $(nfs_count) 个挂载就位，容器已全部拉起，退出"
+				return 0
+			fi
+			_tries=$((_tries + 1))
+			[ "$_tries" -ge 8 ] && { blog "bootwait: 容器多次启动失败，退出（交给 cron watch）"; return 1; }
+		fi
+
+		if [ "$(date +%s)" -ge "$_deadline" ]; then
+			blog "bootwait: ${BOOT_WAIT_MAX}s 超时退出（缺: $(missing_shares)）"
+			return 1
+		fi
+		sleep 8
+	done
+}
+
+cmd_watch() {
+	# 关机过程中绝不重新挂载
+	[ -f "$STOP_FLAG" ] && exit 0
+
+	_ip="$(grep -i "$NAS_MAC" /tmp/dhcp.leases 2>/dev/null | awk '{print $3}' | head -1)"
+	[ -z "$_ip" ] && _ip="$NAS_IP_DEFAULT"
+	_cur="$(cat "$CUR_IP_FILE" 2>/dev/null)"
+
+	# 挂载齐全且 IP 未变: 只兜底确认容器该起的都起着
+	if nfs_complete; then
+		[ "$_ip" != "$_cur" ] && echo "$_ip" >"$CUR_IP_FILE"
+		cmd_restore
+		record_running
+		exit 0
+	fi
+
+	blog "需要重挂: 探测IP=$_ip 记录=${_cur:-无} 现有=$(nfs_count) 缺: $(missing_shares)"
+	if [ "$(nfs_count)" -gt 0 ]; then
+		# 部分挂载或 IP 变了: 先摘掉旧的再整体重挂
+		for _mp in $(awk '$3=="nfs"||$3=="nfs4"{print $2}' /proc/mounts); do
+			umount -l "$_mp" >/dev/null 2>&1
+		done
+	fi
+	cmd_mount "$_ip" || true
+
+	if ! nfs_complete; then
+		blog "重挂未完成，保留现状等下一轮"
+		exit 0
+	fi
+
+	# IP 变化时运行中的容器持有的是失效绑定，必须重启才能重新解析
+	for _c in $(docker ps --format '{{.Names}}' 2>/dev/null); do
+		if docker inspect -f '{{range .Mounts}}{{.Source}} {{end}}' "$_c" 2>/dev/null | grep -qE '/nfs/|/mnt/nas'; then
+			docker restart -t 10 "$_c" >/dev/null 2>&1 && blog "restarted $_c"
+		fi
+	done
+	cmd_restore
+	record_running
+	exit 0
+}
+
+# 持续刷新"预期运行"名单。关机时 K86 会重写一次，但异常断电没有这个机会，
+# 所以由 cron 的 watch 每 2 分钟同步一次，保证名单始终反映真实运行态。
+record_running() {
+	docker info >/dev/null 2>&1 || return 0
+	mkdir -p "$STATE_DIR"
+	docker ps --format '{{.Names}}' >"$LIST_TMP" 2>/dev/null || return 0
+	[ -s "$LIST_TMP" ] || return 0
+	mv "$LIST_TMP" "$LAST_LIST"
+}
+
+# ------------------------------------------------------------------ 查看
+cmd_status() {
+	_ip="$(cat "$CUR_IP_FILE" 2>/dev/null)"
+	[ -z "$_ip" ] && _ip="$NAS_IP_DEFAULT"
+	echo "nfs-guard $VERSION"
+	if nas_reachable "$_ip"; then
+		echo "NAS     : $_ip  在线"
+	else
+		echo "NAS     : $_ip  不可达"
+	fi
+	echo "记录 IP : ${_ip}  (文件 $CUR_IP_FILE)"
+	set -- $(cat "$STATUS_FILE" 2>/dev/null)
+	echo "状态    : ${1:-未知} ${2:-}  更新于 $(date -d "@${3:-0}" '+%H:%M:%S' 2>/dev/null || echo -)"
+	if nfs_complete; then
+		echo "完整性  : 全部就位 ($(nfs_count) 个)"
+	else
+		echo "完整性  : 缺 $(missing_shares)"
+	fi
+	echo
+	printf '%-20s %-9s %s\n' "挂载点" "类型" "总量 / 已用"
+	for _mp in $(awk '$3=="nfs"||$3=="nfs4"{print $2}' /proc/mounts); do
+		_o="$(awk -v t="$_mp" '$2==t{print ($4 ~ /(^|,)ro(,|$)/)?"ro":"rw"}' /proc/mounts)"
+		# busybox df 对超长设备名会折行，取最后一行解析
+		_d="$(df -h "$_mp" 2>/dev/null | tail -1 | awk 'NF>=4{print $1" / "$2}')"
+		printf '%-20s %-9s %s\n' "$_mp" "$_o" "${_d:-?}"
+	done
+	echo
+	echo "钩子:"
+	for _h in /etc/rc.d/S97nfs-guard /etc/rc.d/S99dockerd /etc/rc.d/S99nfs-bootwait \
+		/etc/rc.d/S99nfs-guard-start /etc/rc.d/K86nfs-guard /etc/rc.d/K90umount \
+		/etc/rc.d/K98powerguard; do
+		[ -e "$_h" ] && echo "  $(basename "$_h")"
+	done
+	_c=$(grep -c 'nfs-guard watch' /etc/crontabs/root 2>/dev/null)
+	[ -z "$_c" ] && _c=0
+	echo "cron    : $_c 条"
+	[ -f "$STATE_DIR/shutdown.state" ] && echo "上次关机: $(cat "$STATE_DIR/shutdown.state")"
+	if [ -f "$SLOG_FILE" ]; then
+		echo "关机日志末尾 ($SLOG_FILE):"
+		tail -6 "$SLOG_FILE" | sed 's/^/  /'
+	fi
+}
+
+cmd_doctor() {
+	_bad=0
+	chk() { if eval "$2"; then echo "  [ok]   $1"; else echo "  [FAIL] $1"; _bad=$((_bad + 1)); fi; }
+
+	echo "nfs-guard doctor"
+	chk "运行脚本存在"        "[ -x /usr/local/bin/nfs-guard ]"
+	chk "init 脚本存在"       "[ -x /etc/init.d/nfs-guard ]"
+	chk "开机钩子 S97"        "[ -e /etc/rc.d/S97nfs-guard ]"
+	chk "后台补齐 S99"        "[ -e /etc/rc.d/S99nfs-bootwait ]"
+	chk "开机钩子 S99(容器)"  "[ -e /etc/rc.d/S99nfs-guard-start ]"
+	chk "关机钩子 K86"        "[ -e /etc/rc.d/K86nfs-guard ]"
+	chk "关机钩子 K60 停容器" "[ -e /etc/rc.d/K60nfs-guard-dockstop ]"
+	chk "K60 早于 K86"        "[ -e /etc/rc.d/K60nfs-guard-dockstop ] && [ -e /etc/rc.d/K86nfs-guard ]"
+	chk "K86 早于 K90network" "[ -e /etc/rc.d/K86nfs-guard ] && [ -e /etc/rc.d/K90network ]"
+	chk "S97 早于 S99dockerd" "[ -e /etc/rc.d/S97nfs-guard ] && [ -e /etc/rc.d/S99dockerd ]"
+	chk "umount 已打补丁"      "grep -q wrtpatch /etc/init.d/umount 2>/dev/null"
+	chk "cron 守护已注册"      "grep -q 'nfs-guard watch' /etc/crontabs/root 2>/dev/null"
+	chk "rc.local 无旧脚本"    "! grep -q 'nfs-mounts.sh\\|nfs-ip-watchdog' /etc/rc.local 2>/dev/null"
+	chk "旧脚本已移除"        "[ ! -e /usr/local/bin/nfs-mounts.sh ] && [ ! -e /usr/local/bin/nfs-ip-watchdog.sh ]"
+	chk "容器名单可用"        "[ -f $LAST_LIST ]"
+	echo "  [info] NFS 挂载: $(nfs_count) 个$(nfs_complete && echo '（完整）' || echo "，缺 $(missing_shares)")"
+	echo "  [info] 关机前容器名单: $(cat "$LAST_LIST" 2>/dev/null | wc -l) 个"
+	[ -f "$STATE_DIR/shutdown.state" ] && echo "  [info] 上次关机: $(cat "$STATE_DIR/shutdown.state")"
+	[ -f "$STOP_FLAG" ] && echo "  [warn] 关机标志残留 $STOP_FLAG"
+	if [ "$_bad" -eq 0 ]; then echo "结果: 全部通过"; return 0; fi
+	echo "结果: $_bad 项异常"
+	return 1
+}
+
+usage() {
+	cat <<EOF
+nfs-guard $VERSION — NAS NFS 一体化管理
+
+用法: nfs-guard <命令>
+  mount [IP]   挂载全部共享(带等待与重试)，IP 缺省自动探测
+  dockstop     停机第1步(K60): 只停容器并记录名单（独立 15s 预算）
+  umount       停机第2步(K86): 清占用 -> 有界同步 -> 并发卸载
+  presync      /etc/init.d/umount 用: 判断能否安全 sync
+  bootwait     开机后台补齐: 等 NAS 上线 -> 挂载 -> 拉容器
+  watch        cron 用: 检测 IP 变化/挂载缺失并重挂 + 拉起容器
+  restore      按关机前名单启动容器（挂载不完整时拒绝执行）
+  heal         补起"被 dockerd 抢先拉起、因 NFS 未就绪而创建失败"的容器
+  watchdog     关机看门狗（内部使用）
+  status       查看挂载、容量、钩子状态
+  doctor       自检部署完整性
+
+注意: dockstop/umount 会停掉所有容器，仅在关机或确认可中断服务时使用。
+EOF
+}
+
+case "$1" in
+	mount)    shift; cmd_mount "$@" ;;
+	dockstop) cmd_dockstop ;;
+	umount)   cmd_umount ;;
+	presync)  cmd_presync ;;
+	bootwait) cmd_bootwait ;;
+	watch)    cmd_watch ;;
+	restore)  cmd_restore ;;
+	heal)     cmd_heal ;;
+	watchdog) cmd_watchdog ;;
+	status)   cmd_status ;;
+	doctor)   cmd_doctor ;;
+	*) usage; exit 1 ;;
+esac

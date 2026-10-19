@@ -1,0 +1,4 @@
+# Intel Atom C3000 integrated QAT (C3XXX, PCI 8086:19e2)
+# Correct modules are qat_c3xxx / qat_c3xxxvf, NOT qat_dh895xcc (0x0435).
+qat_c3xxx
+qat_c3xxxvf

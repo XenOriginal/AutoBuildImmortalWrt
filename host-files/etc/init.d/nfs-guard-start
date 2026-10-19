@@ -1,0 +1,22 @@
+#!/bin/sh /etc/rc.common
+# /etc/init.d/nfs-guard-start
+#   S99: 在 dockerd 启动之后，按关机前记录的名单把容器拉起来。
+#
+# 为什么需要它:
+#   容器 restart 策略是 unless-stopped，被 docker stop 过的容器不会随守护进程
+#   启动而恢复。关机时 K86 会优雅停容器，所以开机必须显式 start 回来。
+#   又不能交给 dockerd 自动拉起——那样会在 NFS 未挂载时绑到空目录。
+#
+# 排序: S99dockerd < S99nfs-guard-start（同号按文件名排），保证 dockerd 先起。
+START=99
+
+boot() {
+	start
+}
+
+start() {
+	[ -x /usr/local/bin/nfs-guard ] || return 0
+	/usr/local/bin/nfs-guard restore
+}
+
+stop() { :; }

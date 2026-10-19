@@ -1,0 +1,38 @@
+# 默认启用的编译期特性片段 (每行一个文件名, 不含 .conf)
+#
+# 未登记在这里的片段 = 可选优化, 默认不编入固件。
+# 需要时用环境变量临时开启 (可逗号分隔多个):
+#     FEATURES=40-net-tune,50-image-slim bash x86-64-host/build-source.sh
+# CI 亦可在 workflow_dispatch 时填 features 输入达到同样效果。
+#
+# 新增/删除一项优化: 只改本文件, 构建脚本主体不动。
+
+# UEFI/Legacy 双启动兼容 (efibootmgr + efivarfs; 后续优先 UEFI 启动)
+12-uefi-boot
+
+# KVM/QEMU 硬件虚拟化宿主能力 (/dev/kvm + vhost-net + QEMU)
+10-kvm-host
+
+# VT-d/IOMMU 直通能力预留 (Intel IOMMU 默认开 + VFIO; BIOS 打开 VT-d 即可用)
+15-iommu-vtd
+
+# A/B 安全自升级: GRUB grubenv 工具 (配套构建期补丁见 ab/patches/)
+17-grub-ab
+
+# 加密/校验内核模块 (SHA-1/SHA-256/GHASH/CRC32C; AES-NI 官方基线已内建)
+20-crypto-accel
+
+# Intel CPU 微码更新 (Denverton 勘误, 安全与稳定性)
+30-microcode
+
+# 硬件适配补全: 看门狗(挂死自动重启) + 温度/SSD 健康巡检
+35-hw-health
+
+# 可移动存储: exFAT/NTFS/FAT32 工具 + UTF-8 文件名默认 + fstrim
+25-storage-fs
+
+# 虚拟化内核调优(THP/HugeTLB) + 网络队列算法能力(sch_fq/sch_cake)
+45-kvm-net-perf
+
+# 内核 hung_task / softlockup 可观测性
+55-lockup-detect

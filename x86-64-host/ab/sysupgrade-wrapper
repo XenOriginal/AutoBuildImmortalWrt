@@ -1,0 +1,88 @@
+#!/bin/sh
+# ============================================================================
+# sysupgrade 安全守护包装器 (放在 /usr/sbin/sysupgrade, 优先级高于 /sbin/sysupgrade)
+#
+# 作用:
+#   防止用户/外部脚本在 A/B 布局机器上误敲 sysupgrade 导致整盘被 dd 覆写变砖。
+#   - 备份/恢复参数 (--backup, --restore-backup, --list-backup 等) -> 直接放行
+#   - 固件刷写操作:
+#       * 检测到 A/B 布局: 拦截破坏性覆写, 自动安全转调 /usr/sbin/ab-upgrade
+#       * 显式指定 --force-sysupgrade-bypass-ab 时方允许强行调用原生 /sbin/sysupgrade
+# ============================================================================
+set -eu
+
+REAL_SYSUPGRADE="/sbin/sysupgrade"
+
+# 如果没有 A/B 检查工具，直接透传
+if ! command -v ab-status >/dev/null 2>&1; then
+    exec "$REAL_SYSUPGRADE" "$@"
+fi
+
+# 检查是否处于 A/B 布局
+if ! ab-status --check >/dev/null 2>&1; then
+    # 非 A/B 布局机器，原样放行
+    exec "$REAL_SYSUPGRADE" "$@"
+fi
+
+# 检查参数
+BYPASS_AB=0
+IS_BACKUP_OP=0
+IMAGE_FILE=""
+NO_OVERLAY=0
+ASSUME_YES=0
+
+for arg in "$@"; do
+    case "$arg" in
+        --force-sysupgrade-bypass-ab)
+            BYPASS_AB=1
+            ;;
+        -b|--backup*|-r|--restore*|-l|--list-backup*|--help|-h)
+            IS_BACKUP_OP=1
+            ;;
+        -n)
+            # 原版 sysupgrade 的 -n 代表不保留配置，对应 ab-upgrade 的 --no-overlay
+            NO_OVERLAY=1
+            ;;
+        -y)
+            ASSUME_YES=1
+            ;;
+        *)
+            if [ -f "$arg" ]; then
+                IMAGE_FILE="$arg"
+            fi
+            ;;
+    esac
+done
+
+# 如果用户强行旁路 A/B 保护
+if [ "$BYPASS_AB" = 1 ]; then
+    echo "⚠️ [A/B 警告] 您已显式指定 --force-sysupgrade-bypass-ab，A/B 守护已旁路！" >&2
+    # 过滤掉旁路参数后调用原程序
+    ARGS=""
+    for a in "$@"; do
+        [ "$a" = "--force-sysupgrade-bypass-ab" ] && continue
+        ARGS="$ARGS \"$a\""
+    done
+    eval exec "$REAL_SYSUPGRADE" $ARGS
+fi
+
+# 备份/查询类操作直接放行
+if [ "$IS_BACKUP_OP" = 1 ] || [ -z "$IMAGE_FILE" ]; then
+    exec "$REAL_SYSUPGRADE" "$@"
+fi
+
+# 拦截固件刷写操作并转交 ab-upgrade
+cat <<'EOF'
+=============================================================================
+🛡️  A/B 双槽安全守护已介入 (sysupgrade -> ab-upgrade)
+检测到本机运行在 A/B 双槽安全架构下！
+原生 sysupgrade 会以整盘 dd 覆写破坏 GPT 分区表与 A/B 引导环境。
+系统已自动拦截原生覆写，转由【A/B 双槽自升级器 (ab-upgrade)】安全写入备用槽。
+=============================================================================
+EOF
+
+AB_ARGS=""
+[ "$NO_OVERLAY" = 1 ] && AB_ARGS="$AB_ARGS --no-overlay"
+[ "$ASSUME_YES" = 1 ] && AB_ARGS="$AB_ARGS --yes"
+
+eval exec "/usr/sbin/ab-upgrade" "$IMAGE_FILE" $AB_ARGS

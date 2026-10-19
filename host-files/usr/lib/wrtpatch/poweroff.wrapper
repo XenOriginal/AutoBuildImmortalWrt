@@ -1,0 +1,256 @@
+#!/bin/sh
+# ==========================================================================
+# /sbin/poweroff —— 由 /usr/local/sbin/wrtpatch 安装，请勿手改
+#
+# 原始状态: /sbin/poweroff -> ../bin/busybox （软链接）
+#
+# 【为什么不能只做"留标记 + 转 busybox poweroff"】
+#   本机 ACPI 被 BIOS 关死（Hardware did not enter ACPI mode），内核没有
+#   pm_power_off，断电只能靠自己写 PM1_CNT。但真正断电的 K98 钩子排在整个
+#   procd 关机链的最后：
+#       K60 停容器 -> K86 卸 NFS -> K90network 断网 -> K90umount -> K98 断电
+#   2026-10-18 01:31 的实测：K86 已经把 6 个 NFS 全部优雅卸载（0 残留），
+#   紧接着 K90umount 之后整个链就再没有任何进展 —— 串口停在
+#   "br-lan ... entered disabled state"，没有 "reboot: Power down"，
+#   也没有 K98 的任何输出。也就是说：**K98 从来没被执行过**，
+#   S5 兜底根本没机会跑，机器永远停在那儿，只能拔电。
+#
+# 【v2 思路：别把命交给 procd 的关机链】
+#   busybox `poweroff` 只是给 init 发 SIGUSR2，之后的一切都不可控。
+#   所以这里自己做"确定性关机引擎"：
+#       停容器 -> 卸 NFS -> sync -> 卸本地数据盘 -> sync -> 写 S5
+#   每一步都有硬上限，并且全程往 /dev/kmsg 打点（kmsg 直接进内核环形缓冲，
+#   串口一定看得到，不像 /dev/console 会被 tty0 抢走）。
+#   另有一个脱离会话的监督进程按"心跳停滞"兜底：任意一步卡住 12s，
+#   它就直接写 S5 —— 保证"最多等十几秒，绝不会无限期挂着等人工拔电"。
+#
+# 【两种运行模式】
+#   poweroff              正常关机（本引擎）
+#   poweroff --dryrun     演练：做完停容器/卸 NFS/sync，不写 S5，
+#                         便于在 SSH 里验证流程后手动恢复
+#   poweroff --supervise  内部使用：心跳监督进程
+#
+# 还原: /usr/local/sbin/wrtpatch revert
+# ==========================================================================
+STATE=/root/wrtpatch/state
+PLOG="$STATE/poweroff.log"
+MARK=/tmp/.poweroff-requested
+MARK2="$STATE/poweroff.flag"
+HB=/tmp/.poweroff-hb
+DONE=/tmp/.poweroff-done
+LOCK=/tmp/.poweroff-lock
+GUARD=/usr/local/bin/powerguard
+NG=/usr/local/bin/nfs-guard
+# 心跳停滞多少秒判定卡死（正常每步 1~10s）
+STALL="${WRT_POWEROFF_STALL:-20}"
+# 总时长上限（兜底，防止某些步骤反复重试）
+DEADLINE="${WRT_POWEROFF_DEADLINE:-75}"
+DRYRUN=0
+
+# ---------------------------------------------------------------- 打点
+# /dev/kmsg 是内核打印通道，串口必然可见；同时落盘到 /root，重启后仍可查。
+kp() {
+	_m="wrtpatch-poweroff: $*"
+	echo "$_m" >/dev/kmsg 2>/dev/null
+	[ -d "$STATE" ] || mkdir -p "$STATE" 2>/dev/null
+	echo "$(date '+%F %T') $*" >>"$PLOG" 2>/dev/null
+}
+
+hb() { date +%s >"$HB" 2>/dev/null; }
+
+now() { date +%s; }
+
+T0=0
+el() { echo "$(( $(now) - T0 ))s"; }
+
+is_mounted() { awk -v m="$1" '$2==m{f=1} END{exit !f}' /proc/mounts 2>/dev/null; }
+
+nfs_left() { awk '$3=="nfs"||$3=="nfs4"{f=1} END{exit !f}' /proc/mounts 2>/dev/null; }
+
+# 后台执行 + 限时，绝不无限期等待（D 状态 kill 不掉，只能放手）
+run_bounded() { # $1=秒 $2=描述 其余=命令
+	_to="$1"; _d="$2"; shift 2
+	"$@" >/dev/null 2>&1 &
+	_p=$!
+	_i=0
+	while [ "$_i" -lt "$_to" ]; do
+		kill -0 "$_p" 2>/dev/null || return 0
+		sleep 1
+		_i=$((_i + 1))
+	done
+	kp "$_d 超过 ${_to}s 未返回（可能 D 状态），放弃等待继续关机"
+	return 1
+}
+
+umount_one_bounded() { # $1=挂载点 $2=秒
+	is_mounted "$1" || return 0
+	if run_bounded "$2" "umount $1" /bin/umount "$1"; then
+		kp "已卸载 $1"
+		return 0
+	fi
+	/bin/umount -l "$1" >/dev/null 2>&1
+	return 1
+}
+
+# ---------------------------------------------------------------- 监督进程
+# 独立会话运行，procd 最后 kill(-1) 也杀不掉它（忽略 TERM/HUP）。
+# 判定"卡死"只看心跳：任何一步超过 STALL 秒没更新心跳就动手。
+supervise() {
+	trap '' INT TERM HUP
+	if [ "${WRT_POWEROFF_DRYRUN:-0}" = "1" ]; then
+		kp "监督进程: 演练模式，不做断电"
+		return 0
+	fi
+	[ -f "$HB" ] || hb
+	_start=$(cat "$HB" 2>/dev/null)
+	[ -n "$_start" ] || _start=$(now)
+	kp "监督进程已启动（停滞阈值 ${STALL}s，总上限 ${DEADLINE}s）"
+	while :; do
+		sleep 2
+		[ -f "$DONE" ] && return 0
+		_n=$(now)
+		_b=$(cat "$HB" 2>/dev/null)
+		[ -n "$_b" ] || _b="$_n"
+		_idle=$((_n - _b))
+		_total=$((_n - _start))
+		if [ "$_idle" -ge "$STALL" ]; then
+			kp "监督: 关机停滞 ${_idle}s（总 ${_total}s），强制断电"
+			break
+		fi
+		if [ "$_total" -ge "$DEADLINE" ]; then
+			kp "监督: 关机总耗时 ${_total}s 超上限，强制断电"
+			break
+		fi
+	done
+	# 断电只能靠自己：连写三次 PM1_CNT，每次间隔 2s（写成功的话进程立刻消失）
+	_n=0
+	while [ "$_n" -lt 3 ]; do
+		_n=$((_n + 1))
+		kp "监督: 第 ${_n} 次尝试 S5"
+		POWERGUARD_FORCE=1 "$GUARD" fallback >/dev/null 2>&1
+		sleep 2
+	done
+	kp "监督: S5 三次均未生效，尝试内核 halt（本机可能仍需人工断电）"
+	echo 1 >/proc/sys/kernel/sysrq 2>/dev/null
+	echo o >/proc/sysrq-trigger 2>/dev/null
+	sleep 3
+	kp "监督: halt 后仍存活，停止动作（数据已 sync，可安全断电报）"
+	return 0
+}
+
+# ---------------------------------------------------------------- 主引擎
+engine() {
+	# 关机过程中不接受 Ctrl-C / procd 的 TERM，否则会停在半拆状态
+	trap '' INT TERM HUP
+
+	if [ -f "$LOCK" ]; then
+		kp "已有 poweroff 流程在跑，忽略本次重复请求"
+		exit 0
+	fi
+	: >"$LOCK"
+	rm -f "$DONE"
+	mkdir -p "$STATE" 2>/dev/null
+
+	_up=$(awk '{printf "%d", $1}' /proc/uptime 2>/dev/null)
+	echo "$_up" >"$MARK" 2>/dev/null
+	echo "$_up" >"$MARK2" 2>/dev/null
+	hb
+	kp "====== 开始关机 (uptime=${_up}s dryrun=${DRYRUN}) ======"
+
+	# 先布防监督进程，再干活 —— 顺序不能反
+	export WRT_POWEROFF_DRYRUN="$DRYRUN"
+	if [ -x /usr/bin/setsid ]; then
+		/usr/bin/setsid /bin/sh /sbin/poweroff --supervise </dev/null >/dev/null 2>&1 &
+	else
+		/bin/sh /sbin/poweroff --supervise </dev/null >/dev/null 2>&1 &
+	fi
+
+	T0=$(now)
+
+	# ---- 1) 停容器（顺带记录名单，供下次开机 restore）----
+	hb
+	if [ -x "$NG" ]; then
+		kp "第1步 停止容器"
+		NFS_SHUTDOWN=1 "$NG" dockstop
+		kp "第1步完成 $(el)（剩余容器 $(docker ps -q 2>/dev/null | wc -l) 个）"
+	else
+		kp "第1步 跳过（nfs-guard 不存在）"
+	fi
+
+	# ---- 2) 卸载 NFS（服务端可达才优雅同步，否则强制/惰性）----
+	hb
+	if [ -x "$NG" ]; then
+		kp "第2步 卸载 NFS"
+		NFS_SHUTDOWN=1 "$NG" umount
+		if nfs_left; then
+			kp "第2步完成 $(el)，仍有 NFS 残留（已惰性摘除）"
+		else
+			kp "第2步完成 $(el)，0 个残留"
+		fi
+	else
+		kp "第2步 跳过（nfs-guard 不存在）"
+	fi
+
+	# ---- 3) 刷脏页（还有 NFS 就绝不 sync，那是本机历史上卡死的根因）----
+	hb
+	if nfs_left; then
+		kp "第3步 跳过 sync（仍有 NFS 挂载，避免 D 状态卡死）"
+	else
+		kp "第3步 刷新脏页（上限 6s）"
+		run_bounded 6 "sync" /bin/sync
+		kp "第3步完成 $(el)"
+	fi
+
+	# ---- 4) 本地数据盘（演练模式跳过，否则 docker 会被拆坏）----
+	hb
+	if [ "$DRYRUN" = "1" ]; then
+		kp "第4步 [dry-run] 跳过停 dockerd 与卸载本地盘"
+	else
+		kp "第4步 停 dockerd 并卸载本地数据盘（上限 3s/个）"
+		for _p in dockerd containerd; do
+			_pid=$(pidof "$_p" 2>/dev/null)
+			[ -n "$_pid" ] && kill -TERM $_pid 2>/dev/null
+		done
+		sleep 1
+		hb
+		# 顺序：先子挂载再父挂载
+		umount_one_bounded /Lager/docker 2
+		hb
+		umount_one_bounded /mnt/sda1 2
+		hb
+		umount_one_bounded /Lager 2
+		hb
+		if nfs_left; then
+			kp "第4步 跳过二次 sync（NFS 残留）"
+		else
+			run_bounded 3 "sync(2)" /bin/sync
+		fi
+		kp "第4步完成 $(el)"
+	fi
+
+	# ---- 5) 安全转调重启 (因硬件无 S5 断电支持，优雅收敛后自动重启) ----
+	hb
+	kp "第5步 关机准备完成（容器已停、NFS已卸、数据已sync）。硬件不支持S5，转调安全重启"
+	if [ "$DRYRUN" = "1" ]; then
+		kp "[dry-run] 演练结束，不执行重启"
+		rm -f "$LOCK" /tmp/.nfs-guard-stop "$MARK" "$MARK2"
+		mkdir -p "$STATE" 2>/dev/null
+		touch "$STATE/shutdown.done"
+		rm -f /tmp/.nfsguard-wd-armed
+		touch "$DONE"
+		return 0
+	fi
+
+	mkdir -p "$STATE" 2>/dev/null
+	touch "$STATE/shutdown.done"
+	touch "$DONE"
+	sleep 1
+	kp "执行安全重启 /bin/busybox reboot -f"
+	exec /bin/busybox reboot -f
+}
+
+case "$1" in
+	--supervise) supervise ;;
+	--dryrun)    DRYRUN=1; shift; engine "$@" ;;
+	*)           engine "$@" ;;
+esac

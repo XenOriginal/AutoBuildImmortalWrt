@@ -1,0 +1,28 @@
+#!/bin/sh /etc/rc.common
+# ==========================================================================
+# /etc/init.d/nfs-guard-dockstop
+#
+#   关机 K60: 只做一件事 —— 停容器并记录名单。
+#
+# 为什么要单独拆一个钩子：
+#   procd/rcS.c 给每个 K 脚本只留 15 秒：
+#       run_timeout = 15000;  cancel_timeout = 10000;
+#   超时即 SIGTERM（再 10s SIGKILL）。18 个容器 docker stop -t 20 要 21 秒，
+#   挤在 K86 里必然被腰斩，导致 NFS 一个都没卸掉、后续断网后 sync 永久卡死。
+#   拆成两个钩子后各有一个独立的 15s 预算：
+#       K60 (本脚本)  停容器      ~8s
+#       K86 (nfs-guard) 同步+卸载 ~8s
+#
+#   开机无动作（START 只为了让 enable 能同时生成 K 链接）。
+# ==========================================================================
+START=99
+STOP=60
+
+boot() { return 0; }
+start() { return 0; }
+
+stop() {
+	[ -x /usr/local/bin/nfs-guard ] || return 0
+	NFS_SHUTDOWN=1 /usr/local/bin/nfs-guard dockstop
+	return 0
+}

@@ -1,0 +1,37 @@
+#!/bin/sh
+# ==========================================================================
+# /etc/hotplug.d/block/00-fsck-guard
+#
+#   为什么放在这里，而不是 S10：
+#     实测（2026-10-18 重启）发现 /Lager 根本不是 S11fstab 挂的，是这条链挂的：
+#       /etc/hotplug.d/block/10-mount  ->  /sbin/block hotplug
+#       /etc/hotplug.d/block/15-automount -> mount /dev/sdaN /mnt/sdaN
+#     它们在 rcS 之前（约 22s）就把 /Lager、/mnt/sda1 挂好了，
+#     所以任何 S 数字（S10/S09…）都拦不住。
+#
+#     hotplug 钩子按文件名顺序串行执行，00 必然先于 10-mount / 15-automount，
+#     于是"先检查、后挂载"由执行顺序直接保证，不再依赖数字大小猜。
+#
+#   本文件只负责触发，不实现逻辑：
+#     真正干活的是 /usr/local/bin/fsck-guard boot（幂等，同一开机只跑一次）。
+# ==========================================================================
+case "$ACTION" in
+	add|change) ;;
+	*) exit 0 ;;
+esac
+
+# 本次开机已检查过就立刻放行，不给挂载添延迟
+[ -e /tmp/.fsck-guard-done ] && exit 0
+
+# /usr/local/bin 在 overlay 上：极少数情况下 block 事件可能早于 overlay 挂载，
+# 此时工具还看不见。等它出现（上限 10s），避免"闸门空转后直接放行"这个洞。
+_i=0
+while [ ! -x /usr/local/bin/fsck-guard ]; do
+	[ "$_i" -ge 10 ] && exit 0
+	_i=$((_i + 1))
+	sleep 1
+done
+
+# 同步执行：本钩子返回之前，10-mount / 15-automount 不会有机会挂载
+/usr/local/bin/fsck-guard boot
+exit 0

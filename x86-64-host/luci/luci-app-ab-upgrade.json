@@ -1,0 +1,23 @@
+{
+	"luci-app-ab-upgrade": {
+		"description": "Grant access to A/B Dual-Slot Firmware Management and Upgrade",
+		"read": {
+			"ubus": {
+				"luci.ab": [ "status", "upgrade_log", "validate_image" ]
+			},
+			"file": {
+				"/tmp/ab-upgrade.log": [ "read" ],
+				"/tmp/ab-upgrade.status": [ "read" ]
+			}
+		},
+		"write": {
+			"cgi-io": [ "upload" ],
+			"ubus": {
+				"luci.ab": [ "bootok", "reboot", "start_upgrade", "switch" ]
+			},
+			"file": {
+				"/tmp/firmware.bin": [ "write" ]
+			}
+		}
+	}
+}

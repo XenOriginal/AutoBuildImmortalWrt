@@ -1,0 +1,253 @@
+#!/bin/sh /etc/rc.common
+# ============================================================================
+# 存储自愈守卫 + dockerd 门控  ——【统一版】
+#
+# 本脚本合并了两套实现(2026-10-15 统一, 避免同机双守卫):
+#   · 本仓库原有版本: 设备按 uci fstab/UUID 解析(迁移到 SSD 后仍正确)、
+#     只读挂载识别、dockerd 门控、status 子命令、dry-run
+#   · 另一版本(lager-guard): 叠加挂载的重复卸载、每次开机对 /boot 主动 fsck
+#     (vfat 无日志, 且 dirty bit 在 rw 挂载态恒为 1, 不能作为异常掉电判据)
+#
+# 【为什么需要它 —— 来自 2026-10-14 真实事故】
+#   本机长期无 UPS、频繁硬断电, 且系统跑在 U 盘上。事故链条:
+#       硬断电 -> sdb4(/Lager ext4) 掉电丢写(journal/orphan 校验和损坏)
+#              -> 开机挂载 /Lager 失败(或只读无 journal)
+#              -> dockerd 的 data-root=/Lager/docker 不存在, docker 就在只有
+#                 ~400MB 的根 overlayfs 上重建目录 -> overlay2 不支持嵌套
+#                 overlay -> 静默退回 vfs -> 容器/镜像"全部消失"
+#   数据其实完好, 只是"看起来丢了", 而且全程没有任何告警 —— 这才是最危险的。
+#
+# 【本脚本做三件事】
+#   1. 自愈: 对关键挂载点(/Lager, /boot)做
+#        只读挂载 -> 先试 remount,rw, 不行则卸载后修复重挂
+#        未挂载   -> 先试直接挂载; 失败则安全预检(e2fsck -p), 再失败则强制(-y)
+#      fsck 前会先卸载该设备的【所有】叠加挂载(如 /Lager/docker), 否则 fsck
+#      会因设备忙而拒绝执行。
+#   2. /boot 主动检修(默认开): vfat 没有日志, 且 dirty bit 在 rw 挂载态恒为 1,
+#      不能作为"上次是否异常掉电"的判据。因此每次开机在可卸载的前提下
+#      跑一遍 fsck.fat -a(/boot 仅 32MB, 对干净盘幂等), 再挂回。
+#   3. 门控: 若 /Lager 最终仍不可用, 则【禁用 dockerd 自启】并留下醒目标记 ——
+#      宁可 docker 不起来(人能看到), 也不要它带着错误的 data-root 静默启动。
+#
+# 【配置】/etc/hw-storage-guard.conf (可选):
+#   GUARD_TARGETS="/Lager|e2fsck,-p,-y /boot|fsck.fat,-a,"
+#       格式: 挂载点|fsck命令,预检参数,强制参数  (参数用逗号分隔, 不能含空格)
+#   GUARD_FORCE=1           预检失败后允许强制修复(默认 1)
+#   GUARD_GATE_DOCKER=1     /Lager 不可用时禁用 dockerd 自启(默认 1)
+#   GUARD_PROACTIVE_BOOT=1  每次开机主动 fsck /boot(默认 1)
+#   GUARD_DRY_RUN=0         1=只记录将要执行的动作, 不改动任何东西
+#
+# 【手动使用】
+#   /etc/init.d/hw-storage-guard status                 # 只读: 看状态
+#   GUARD_DRY_RUN=1 /etc/init.d/hw-storage-guard start  # 演练: 不实际改动
+#   /etc/init.d/hw-storage-guard start                  # 立即跑一次自愈
+#   日志: /etc/hw-storage-guard.log + logread -e hw-storage-guard
+#
+# 【修复后恢复 docker】
+#   /etc/init.d/dockerd enable && /etc/init.d/dockerd start
+# ============================================================================
+
+START=98
+STOP=02
+
+LOG=/etc/hw-storage-guard.log
+MARK=/etc/hw-storage-guard.FAILED
+CONF=/etc/hw-storage-guard.conf
+
+GUARD_TARGETS=${GUARD_TARGETS:-"/Lager|e2fsck,-p,-y /boot|fsck.fat,-a,"}
+GUARD_FORCE=${GUARD_FORCE:-1}
+GUARD_GATE_DOCKER=${GUARD_GATE_DOCKER:-1}
+GUARD_PROACTIVE_BOOT=${GUARD_PROACTIVE_BOOT:-1}
+GUARD_DRY_RUN=${GUARD_DRY_RUN:-0}
+
+log() { logger -t hw-storage-guard "$1" 2>/dev/null; echo "$(date '+%F %T') $1" >> "$LOG"; }
+dry() { [ "$GUARD_DRY_RUN" = 1 ] && { log "[DRY-RUN] 将执行: $*"; return 0; }; return 1; }
+
+mounted() { awk -v m="$1" '$2==m{found=1} END{exit !found}' /proc/mounts; }
+mounted_rw() { awk -v m="$1" '$2==m && $4 !~ /(^|,)ro(,|$)/ {ok=1} END{exit !ok}' /proc/mounts; }
+
+# 由 uci fstab + block info 解析挂载点对应的设备 (不写死设备名 -> 迁移到 SSD 后仍正确)
+dev_of() { # $1=mountpoint
+    local sect uuid lab d
+    sect=$(uci -q show fstab 2>/dev/null | awk -F. -v t="$1" '$0 ~ "target=."t"." {print $2; exit}')
+    [ -n "${sect:-}" ] || return 1
+    uuid=$(uci -q get "fstab.$sect.uuid" 2>/dev/null)
+    if [ -n "${uuid:-}" ]; then
+        block info 2>/dev/null | grep -i "$uuid" | cut -d: -f1 | head -1
+        return 0
+    fi
+    lab=$(uci -q get "fstab.$sect.label" 2>/dev/null)
+    if [ -n "${lab:-}" ]; then
+        block info 2>/dev/null | grep -i "LABEL=\"$lab\"" | cut -d: -f1 | head -1
+        return 0
+    fi
+    d=$(uci -q get "fstab.$sect.device" 2>/dev/null)
+    [ -n "${d:-}" ] && { echo "$d"; return 0; }
+    return 1
+}
+
+# 卸载 $1 与该设备的其它叠加挂载(如 /Lager/docker)。fsck 要求设备完全不被挂载。
+um_all() { # $1=mountpoint $2=dev
+    local mp=$1 dev=$2 i=0 p
+    [ -n "${dev:-}" ] || return 0
+    for p in $(awk -v d="$dev" '$1==d{print $2}' /proc/mounts); do
+        dry "umount $p" && continue
+        umount "$p" 2>/dev/null
+    done
+    while [ "$i" -lt 4 ]; do
+        mounted "$mp" || break
+        dry "umount $mp" && break
+        umount "$mp" 2>/dev/null || break
+        i=$((i + 1))
+    done
+}
+
+# $1=命令规格 "cmd,预检参数,强制参数"  $2=dev  $3=force(0/1)
+fsck_by_name() {
+    local spec=$1 dev=$2 force=$3 exe a2 a3 args
+    exe=$(echo "$spec" | cut -d, -f1)
+    a2=$(echo "$spec" | cut -d, -f2 | tr ',' ' ')
+    a3=$(echo "$spec" | cut -d, -f3 | tr ',' ' ')
+    if [ "$force" = 1 ] && [ -n "$a3" ]; then args=$a3; else args=$a2; fi
+    if dry "$exe $args $dev"; then return 0; fi
+    case "$exe" in
+        e2fsck)    e2fsck $args "$dev" >>"$LOG" 2>&1 ;;
+        fsck.fat)  fsck.fat $args "$dev" >>"$LOG" 2>&1 ;;
+        fsck.f2fs) fsck.f2fs $args "$dev" >>"$LOG" 2>&1 ;;
+        *) return 1 ;;
+    esac
+}
+
+# 取 fstab 里该挂载点的挂载参数(若有), 重挂时沿用, 避免丢失 noatime/iocharset 等
+mount_opts() { # $1=mountpoint
+    local sect opts
+    sect=$(uci -q show fstab 2>/dev/null | awk -F. -v t="$1" '$0 ~ "target=."t"." {print $2; exit}')
+    [ -n "${sect:-}" ] || return 0
+    opts=$(uci -q get "fstab.$sect.options" 2>/dev/null)
+    [ -n "${opts:-}" ] && echo "$opts"
+}
+
+try_mount() { # $1=dev $2=mountpoint
+    local opts
+    opts=$(mount_opts "$2")
+    if [ -n "$opts" ]; then dry "mount -o $opts $1 $2" && return 0; else dry "mount $1 $2" && return 0; fi
+    mkdir -p "$2"
+    if [ -n "$opts" ]; then mount -o "$opts" "$1" "$2" 2>/dev/null; else mount "$1" "$2" 2>/dev/null; fi
+}
+
+ensure_mount() { # $1=mountpoint $2=fsck 规格
+    local mp=$1 spec=$2 dev
+
+    if mounted "$mp"; then
+        if mounted_rw "$mp"; then
+            if [ "$mp" = /boot ] && [ "$GUARD_PROACTIVE_BOOT" = 1 ]; then
+                dev=$(dev_of "$mp")
+                if [ -n "${dev:-}" ]; then
+                    um_all "$mp" "$dev"
+                    if mounted "$mp"; then
+                        log "$mp 仍被占用, 跳过主动 fsck(不对挂载中的文件系统写盘)"
+                    else
+                        log "$mp 主动检修: fsck.fat -a $dev"
+                        fsck_by_name "$spec" "$dev" 0
+                        try_mount "$dev" "$mp" || log "  !! $mp 检修后重新挂载失败"
+                    fi
+                fi
+            else
+                log "$mp 已可读写挂载, 跳过"
+            fi
+            return 0
+        fi
+        log "!! $mp 处于【只读】挂载 —— 先试 remount,rw"
+        if dry "mount -o remount,rw $mp"; then :; else
+            if mount -o remount,rw "$mp" 2>/dev/null; then
+                log "  ✅ remount,rw 成功"
+                return 0
+            fi
+        fi
+        dev=$(dev_of "$mp")
+        um_all "$mp" "$dev"
+    fi
+
+    dev=${dev:-$(dev_of "$mp")}
+    if [ -z "${dev:-}" ]; then
+        log "!! $mp: 无法从 fstab 解析设备"
+        return 1
+    fi
+
+    log "$mp 未挂载 (设备 $dev) -> 先尝试直接挂载"
+    if try_mount "$dev" "$mp"; then
+        log "  ✅ 直接挂载成功"
+        return 0
+    fi
+
+    log "  直接挂载失败 -> 安全预检: $(echo "$spec" | tr ',' ' ') $dev"
+    fsck_by_name "$spec" "$dev" 0
+    if try_mount "$dev" "$mp"; then
+        log "  ✅ 预检修复后挂载成功"
+        return 0
+    fi
+
+    if [ "$GUARD_FORCE" = 1 ]; then
+        log "  仍失败 -> 强制修复(可能较慢)"
+        fsck_by_name "$spec" "$dev" 1
+        if try_mount "$dev" "$mp"; then
+            log "  ✅ 强制修复后挂载成功"
+            return 0
+        fi
+    fi
+
+    log "  ❌ $mp 仍然无法挂载 (详见 $LOG)"
+    return 1
+}
+
+gate_docker() {
+    [ "$GUARD_GATE_DOCKER" = 1 ] || return 0
+    mounted_rw /Lager && return 0
+    [ -x /etc/init.d/dockerd ] || return 0
+    if /etc/init.d/dockerd enabled 2>/dev/null; then
+        log "!!! /Lager 不可用 -> 禁用 dockerd 自启(避免静默退回 vfs, 让容器看起来全丢)"
+        log "    恢复: /etc/init.d/dockerd enable && /etc/init.d/dockerd start"
+        if dry "dockerd stop/disable"; then touch "$MARK"; return 0; fi
+        /etc/init.d/dockerd stop 2>/dev/null
+        /etc/init.d/dockerd disable 2>/dev/null
+    else
+        log "!! /Lager 不可用, 且 dockerd 自启已禁用"
+    fi
+    touch "$MARK"
+}
+
+start() {
+    [ -f "$CONF" ] && . "$CONF"
+    log "=== 存储自愈开始 (目标: $GUARD_TARGETS DRY_RUN=$GUARD_DRY_RUN) ==="
+    local fail=0 t
+    for t in $GUARD_TARGETS; do
+        ensure_mount "${t%%|*}" "${t#*|}" || fail=1
+    done
+    gate_docker
+    if [ "$fail" = 0 ]; then
+        rm -f "$MARK"
+        log "=== 自愈完成: 全部挂载点正常 ==="
+    else
+        log "=== 自愈完成: 存在失败项 (见 $MARK) ==="
+    fi
+    return 0
+}
+
+stop() { :; }
+
+status() {
+    local t
+    for t in $GUARD_TARGETS; do
+        printf "%-20s %s\n" "${t%%|*}" "$(mounted "${t%%|*}" && (mounted_rw "${t%%|*}" && echo "已挂载(读写)" || echo "已挂载(只读!)") || echo 未挂载)"
+    done
+    [ -f "$MARK" ] && echo "自愈状态: 上次有失败 ($MARK)" || echo "自愈状态: 正常"
+    if [ -x /etc/init.d/dockerd ]; then
+        /etc/init.d/dockerd enabled 2>/dev/null && echo "dockerd 自启: 已启用" || echo "dockerd 自启: 已禁用(可能被门控)"
+    fi
+    echo "配置: FORCE=$GUARD_FORCE GATE_DOCKER=$GUARD_GATE_DOCKER PROACTIVE_BOOT=$GUARD_PROACTIVE_BOOT DRY_RUN=$GUARD_DRY_RUN"
+    echo "最近日志:"
+    tail -8 "$LOG" 2>/dev/null | sed 's/^/  /'
+}
+
+EXTRA_COMMANDS="status"
+EXTRA_HELP="        status  查看挂载/自愈/dockerd 门控状态"

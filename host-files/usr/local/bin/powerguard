@@ -1,0 +1,285 @@
+#!/bin/sh
+# ==========================================================================
+# powerguard — 本机 ACPI 失效时的 S5 关机兜底
+#
+# 【为什么要它】
+#   本机固件 (Insyde 4.00.11 / Inspur AliMoC-MD-02-25G) 始终进不了 ACPI 模式:
+#       ACPI Error: Hardware did not enter ACPI mode
+#       ACPI Warning: AcpiEnable failed
+#       ACPI: Unable to enable ACPI
+#       ACPI: Interpreter disabled.
+#   实测 PM1_CNT(0x1804) 的 SCI_EN(bit0) 恒为 0，证实硬件不在 ACPI 模式。
+#   于是内核拿不到 pm_power_off，poweroff 只能退化成:
+#       reboot: Power off not available: System halted instead
+#   现象就是"系统停了但没断电"，必须手动拔电。
+#
+# 【怎么兜底】
+#   在关机链最末 (K98，晚于 K90umount / K90network) 直接向 Intel PCH 的
+#   PM1_CNT 写 SLP_TYP=S5 + SLP_EN=1，由芯片组执行掉电——这正是 ACPI 断电
+#   最终要做的同一件事，只是绕开了失效的 ACPI 解释器。
+#
+# 【安全边界】
+#   * 主要由 SCI_EN(PM1_CNT bit0) 判断：为 1 说明硬件已在 ACPI 模式，
+#     内核自己能断电，本兜底立刻让位；为 0 才动手。
+#     （注意：不能用 /sys/firmware/acpi 是否存在来判断——本机该目录不存在，
+#      但历史上曾因此误判，故只认寄存器事实。）
+#   * 仅在本次关机确实是 poweroff 时动作 (/sbin/poweroff 包装器留标记)，
+#     reboot 完全不受影响。
+#   * 写入前先 sync；写不生效则原样交还内核 halt，不改变原有行为。
+#
+# 【前置依赖：/dev 必须还活着】
+#   /dev 是独立 tmpfs，若 K90umount 用 `umount -a` 把它卸掉，/dev/port 就没了，
+#   这里会静默失败（连串口都写不出去）。因此 K90 已改为保护 /dev /tmp。
+#   万一 /dev/port 仍然缺失，这里会尝试 mknod 恢复。
+#
+# 用法:
+#   powerguard check      查看 ACPI / S5 能力与当前 PM1_CNT
+#   powerguard fallback   关机末端的兜底动作 (由 K98 钩子调用)
+#   powerguard poweroff   带标记地执行 poweroff (等价于 poweroff 命令)
+# ==========================================================================
+MARK="/tmp/.poweroff-requested"
+MARK2="/root/wrtpatch/state/poweroff.flag"
+MARK_TTL=300
+PM1_CNT=6148                      # 0x1804: FADT PM_TMR=0x1808 => EVT 0x1800 / CNT 0x1804
+SLP_TYP="${SLP_TYP:-5}"           # Intel PCH: S5 = 5
+LOG_FILE="/tmp/powerguard.log"
+
+log() {
+	_m="powerguard: $*"
+	echo "$_m"
+	echo "$_m" >>"$LOG_FILE" 2>/dev/null
+}
+
+# 关机末段 /tmp 可能已不可写，同时写串口控制台，保证无头机可见
+# 【注意】/dev/console 在有 X 桌面的机器上会落到 tty0（VGA），串口看不到。
+# 所以必须额外写 /dev/kmsg —— 那是内核打印通道，所有 console 都会收到。
+log_console() {
+	_m="powerguard: $*"
+	if [ -e /dev/console ]; then
+		echo "$_m" >/dev/console 2>/dev/null
+	fi
+	echo "$_m" >/dev/kmsg 2>/dev/null
+	echo "$_m" >>"$LOG_FILE" 2>/dev/null
+}
+
+acpi_present() { [ -d /sys/firmware/acpi ]; }
+
+# 还有 nfs 挂载时绝不能 sync——那是本机历史上关机卡死的触发点
+nfs_left() {
+	awk '$3 ~ /^nfs/ { f = 1 } END { exit !f }' /proc/mounts 2>/dev/null
+}
+
+rd_port() {   # $1 = 端口号(十进制)
+	dd if=/dev/port bs=1 skip="$1" count=1 2>/dev/null | hexdump -v -e '1/1 "%u"'
+}
+
+wr_port() {   # $1 = 端口号(十进制), $2 = 字节值
+	_oct=$(printf '%03o' "$2")
+	printf "\\$_oct" | dd of=/dev/port bs=1 seek="$1" conv=notrunc 2>/dev/null
+}
+
+rd_pm1cnt() {
+	_b0=$(rd_port "$PM1_CNT")
+	_b1=$(rd_port "$((PM1_CNT + 1))")
+	if [ -z "$_b0" ] || [ -z "$_b1" ]; then
+		return 1
+	fi
+	echo $((_b0 + _b1 * 256))
+}
+
+# ------------------------------------------------------------------ 兜底
+# 取 poweroff 标记（两个位置任一），返回内容是 uptime 秒数
+take_mark() {
+	for _f in "$MARK" "$MARK2"; do
+		[ -f "$_f" ] || continue
+		cat "$_f" 2>/dev/null
+		rm -f "$MARK" "$MARK2" 2>/dev/null
+		return 0
+	done
+	return 1
+}
+
+# 没有 /dev/port 时尝试补建（/dev 是 tmpfs，可能被卸载过或未生成）
+ensure_port() {
+	[ -c /dev/port ] && return 0
+	[ -d /dev ] || return 1
+	mknod /dev/port c 1 4 2>/dev/null
+	chmod 600 /dev/port 2>/dev/null
+	[ -c /dev/port ]
+}
+
+# ------------------------------------------------------------------ S5
+# 【2026-10-18 01:54 实测教训】SCI_EN=0 时写 SLP_EN，PCH 直接挂死：
+#   整机瞬间无响应、不断电、连串口都再没有一行输出（日志恰好停在"开始写 S5"）。
+# 所以顺序必须是：先把 SCI_EN 置 1 并回读确认，再写 SLP_TYP，最后才置 SLP_EN。
+#
+# 【为什么我们敢自己置 SCI_EN】
+#   ACPI 规范允许：当 FADT 的 ACPI_ENABLE 不被固件支持时，OS 可直接写
+#   PM1_CNT.SCI_EN。本机实测 PM1_CNT 完全可写（写 0x0001、0x1400 都能原样回读），
+#   只是 BIOS 的 SMM 不响应 0xA0（ACPI_ENABLE），所以内核 ACPICA 判定
+#   "Hardware did not enter ACPI mode" 后彻底放弃 ACPI。
+#   而 SCI_EN 又必须为 1 才会被 PM 状态机接受 —— 这就是之前一写就死的根因。
+#
+# 【安全前置】PM1_EN / GPE0_EN 实测均为 0，置 SCI_EN 不会引出无人处理的中断。
+wr_hi() { wr_port "$((PM1_CNT + 1))" "$1"; }
+
+hex4() {
+	_v="${1:-0}"
+	printf '%04x' "$((_v & 0xffff))"
+}
+
+s5_once() {
+	_v=$(rd_pm1cnt 2>/dev/null) || { log_console "读取 PM1_CNT 失败"; return 1; }
+	_v0="$_v"
+
+	if [ $((_v & 1)) -eq 0 ]; then
+		log_console "SCI_EN=0（BIOS 拒绝进 ACPI 模式），尝试直接置位 SCI_EN"
+		wr_port "$PM1_CNT" "$(( (_v & 0xfe) | 1 ))"
+		sleep 1
+		_v=$(rd_pm1cnt 2>/dev/null)
+		if [ -z "$_v" ] || [ $(( _v & 1 )) -eq 0 ]; then
+			log_console "SCI_EN 置位失败（回读 0x$(hex4 "$_v")），放弃 S5：此时硬写 SLP_EN 会挂死平台"
+			return 1
+		fi
+		log_console "SCI_EN 置位成功（PM1_CNT=0x$(hex4 "$_v")）"
+	fi
+
+	# 先只放 SLP_TYP（不置 SLP_EN），确认高字节这半边寄存器吃得进去
+	wr_hi "$(( (SLP_TYP << 2) & 0xff ))"
+	sleep 1
+	_v=$(rd_pm1cnt 2>/dev/null)
+	log_console "预置 SLP_TYP=$SLP_TYP 后 PM1_CNT=0x$(hex4 "$_v")"
+
+	# 半程预演：验证 SCI_EN/SLP_TYP 都可写之后停手，把寄存器恢复原样。
+	# 用法: POWERGUARD_STOP_BEFORE_SLPEN=1 POWERGUARD_FORCE=1 powerguard fallback
+	if [ "${POWERGUARD_STOP_BEFORE_SLPEN:-0}" = "1" ]; then
+		wr_hi 0
+		wr_port "$PM1_CNT" "$(( _v0 & 0xfe ))"
+		log_console "[预演] 在此停手，已恢复 PM1_CNT=0x$(hex4 "$(rd_pm1cnt 2>/dev/null)")"
+		return 1
+	fi
+
+	# 最后一步：置 SLP_EN。要么断电，要么平台挂死，没有第三种可能。
+	log_console "写 SLP_EN（SLP_TYP=$SLP_TYP）—— 此后若无输出属正常断电"
+	wr_hi "$(( ((SLP_TYP << 2) | 0x20) & 0xff ))"
+	sleep 2
+	log_console "写了 SLP_EN 但 2s 后仍未断电（PM1_CNT=0x$(hex4 "$(rd_pm1cnt 2>/dev/null)")）"
+	return 1
+}
+
+do_fallback() {
+	# POWERGUARD_FORCE=1: 忽略标记（由 /sbin/poweroff 引擎及其监督进程调用）。
+	# 注意此时不删除标记，保证后续 K98 / 监督进程还能再试一次。
+	if [ "${POWERGUARD_FORCE:-0}" = "1" ]; then
+		_ts=""
+		log_console "强制模式（不校验 poweroff 标记）"
+	else
+		_ts=$(take_mark) || {
+			log_console "无 poweroff 标记（本次为 reboot/halt），不做 S5"
+			return 0
+		}
+	fi
+	_now=$(awk '{printf "%d", $1}' /proc/uptime 2>/dev/null)
+	# 过期判定：标记里的 uptime 比当前还大 => 中途重启过，属陈旧标记；
+	# 或者距写入已超过 MARK_TTL。两种都必须忽略，否则一次失败的 poweroff
+	# 留下的持久标记会让下一次"重启"变成断电。
+	if [ -n "$_ts" ] && [ -n "$_now" ]; then
+		if [ "$_ts" -gt "$_now" ] || [ $((_now - _ts)) -gt "$MARK_TTL" ]; then
+			log_console "poweroff 标记已失效（写入 ${_ts}s / 当前 ${_now}s），忽略"
+			return 0
+		fi
+	fi
+
+	ensure_port || { log_console "无 /dev/port（/dev 可能已被卸载），无法执行 S5"; return 0; }
+	_v=$(rd_pm1cnt) || { log_console "读取 PM1_CNT 失败"; return 0; }
+	if [ $((_v & 1)) -eq 1 ]; then
+		# 硬件已在 ACPI 模式：内核本该自己断电。走到这里说明内核那条路没成，
+		# 那就由我们按规范补一刀（SCI_EN=1 时写 SLP_EN 是安全的）。
+		log_console "SCI_EN=1（硬件在 ACPI 模式），仍由本兜底执行 S5"
+	else
+		log_console "SCI_EN=0（ACPI 未启用），将由本兜底接管 S5"
+	fi
+
+	_val=$(( (SLP_TYP << 10) | 0x2000 ))
+	_hex=$(printf '%04x' "$_val")
+	log_console "当前 PM1_CNT=0x$(hex4 "$_v")，目标 0x$_hex"
+
+	if nfs_left; then
+		log_console "仍有 NFS 挂载，跳过 sync（避免重演关机卡死，先断电保可用）"
+	else
+		sync
+	fi
+
+	if [ "${POWERGUARD_DRYRUN:-0}" = "1" ]; then
+		_lo=$(printf '%02x' "$(( _val & 0xff ))")
+		_hi=$(printf '%02x' "$(( (_val >> 8) & 0xff ))")
+		log_console "[dry-run] 将写 port 0x$(printf '%x' "$PM1_CNT") <- $_lo $_hi"
+		return 0
+	fi
+
+	s5_once
+	return 0
+}
+
+# ------------------------------------------------------------------ 检查
+do_check() {
+	if acpi_present; then
+		echo "ACPI 状态 : 可用（/sys/firmware/acpi 存在）"
+	else
+		echo "ACPI 状态 : 未启用（Interpreter disabled）"
+	fi
+	if dmesg 2>/dev/null | grep -q "did not enter ACPI mode"; then
+		echo "内核报错  : ACPI Error: Hardware did not enter ACPI mode"
+	else
+		echo "内核报错  : 无 ACPI 启用失败记录"
+	fi
+	_v=$(rd_pm1cnt 2>/dev/null)
+	if [ -n "$_v" ]; then
+		printf 'PM1_CNT   : 0x%04x  SCI_EN=%d\n' "$_v" "$((_v & 1))"
+	else
+		echo "PM1_CNT   : 读取失败（缺 /dev/port 或无权限）"
+	fi
+	_val=$(( (SLP_TYP << 10) | 0x2000 ))
+	if [ -n "$_v" ] && [ $((_v & 1)) -eq 1 ]; then
+		echo "S5 兜底   : 待命（SCI_EN=1，内核自己会断电）"
+	elif ensure_port; then
+		printf 'S5 兜底   : 可用  SLP_TYP=%s -> PM1_CNT 0x%04x\n' "$SLP_TYP" "$_val"
+	else
+		echo "S5 兜底   : 不可用（缺 /dev/port）"
+	fi
+	if [ -f /sbin/poweroff ] && grep -q wrtpatch /sbin/poweroff 2>/dev/null; then
+		echo "poweroff  : 已接管（关机前留标记）"
+	else
+		echo "poweroff  : 未接管（K98 不会断电）"
+	fi
+}
+
+do_poweroff() {
+	_up=$(awk '{printf "%d", $1}' /proc/uptime 2>/dev/null)
+	echo "$_up" >"$MARK" 2>/dev/null
+	mkdir -p "${MARK2%/*}" 2>/dev/null
+	echo "$_up" >"$MARK2" 2>/dev/null
+	log "已标记 poweroff（tmp+持久），转入关机引擎"
+	# 走引擎（停容器→卸 NFS→sync→S5），不要直接 busybox poweroff，
+	# 否则又回到"靠 procd K 链、K98 可能永远轮不到"的老问题
+	if [ -x /sbin/poweroff ]; then
+		exec /sbin/poweroff
+	fi
+	exec /bin/busybox poweroff
+}
+
+case "$1" in
+	check)    do_check ;;
+	fallback) do_fallback ;;
+	poweroff) do_poweroff ;;
+	*)
+		cat <<EOF
+powerguard — ACPI 缺失时的 S5 关机兜底
+
+  check      查看 ACPI / S5 能力与 PM1_CNT 当前值
+  fallback   关机末端兜底（K98 钩子调用，不建议手工执行）
+  poweroff   带标记执行 poweroff（推荐用这个或直接 poweroff）
+EOF
+		exit 1
+		;;
+esac

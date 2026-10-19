@@ -1,0 +1,161 @@
+#!/bin/sh
+# ============================================================================
+# A/B 状态查看
+#   ab-status          基础状态 (当前槽 / grubenv / 内核 / overlay)
+#   ab-status -v       额外显示分区布局与最近日志
+#   ab-status --json   输出 JSON 格式状态 (供 LuCI WebUI / RPC 调用)
+#   ab-status --check  以退出码返回是否处于 A/B 布局 (0=是, 1=否)
+# ============================================================================
+set -eu
+
+# 允许库位置适配
+if [ -f /usr/lib/ab-lib.sh ]; then
+    . /usr/lib/ab-lib.sh
+elif [ -f "$(dirname "$0")/ab-lib.sh" ]; then
+    . "$(dirname "$0")/ab-lib.sh"
+else
+    echo "{\"is_ab\":false,\"error\":\"ab-lib.sh not found\"}"
+    exit 1
+fi
+
+MODE="text"
+case "${1:-}" in
+    -v|--verbose) MODE="verbose" ;;
+    --json)       MODE="json" ;;
+    --check)      MODE="check" ;;
+    "")           MODE="text" ;;
+    *)            echo "用法: ab-status [-v|--verbose|--json|--check]" >&2; exit 1 ;;
+esac
+
+BOOT_DEV=$(ab_boot_dev 2>/dev/null || true)
+if [ -z "$BOOT_DEV" ]; then
+    if [ "$MODE" = "json" ]; then
+        echo '{"is_ab":false,"error":"未找到内核引导分区 (LABEL=kernel)"}'
+        exit 0
+    elif [ "$MODE" = "check" ]; then
+        exit 1
+    else
+        ab_die "找不到内核分区 (LABEL=kernel) —— 本机不是 A/B 布局?"
+    fi
+fi
+
+if [ "$MODE" = "check" ]; then
+    exit 0
+fi
+
+DISK=$(ab_disk_dev 2>/dev/null || true)
+AB_ENV=$(ab_env_path 2>/dev/null || echo /boot/grub/grubenv)
+KDIR=$(ab_kernel_dir 2>/dev/null || echo /boot)
+
+SLOT_DEVS=$(ab_slot_devs 2>/dev/null || true)
+SLOT_A_DEV=$(echo "$SLOT_DEVS" | awk '{print $1}')
+SLOT_B_DEV=$(echo "$SLOT_DEVS" | awk '{print $2}')
+
+CUR=$(ab_current_slot "$SLOT_A_DEV" "$SLOT_B_DEV" 2>/dev/null || echo unknown)
+CUR_CMDLINE=$(tr ' ' '\n' < /proc/cmdline 2>/dev/null | sed -n 's/^root=PARTUUID=//p' | head -1)
+
+PARTUUID_A=$(blkid -s PARTUUID -o value "${SLOT_A_DEV:-/nonexistent}" 2>/dev/null || ab_partuuid_gpt "$DISK" 3 2>/dev/null || echo "")
+PARTUUID_B=$(blkid -s PARTUUID -o value "${SLOT_B_DEV:-/nonexistent}" 2>/dev/null || ab_partuuid_gpt "$DISK" 4 2>/dev/null || echo "")
+
+KA_SIZE=0; KA_TIME=""
+if [ -f "$KDIR/vmlinuz.a" ]; then
+    KA_SIZE=$(stat -c%s "$KDIR/vmlinuz.a" 2>/dev/null || echo 0)
+    KA_TIME=$(date -r "$KDIR/vmlinuz.a" '+%Y-%m-%d %H:%M:%S' 2>/dev/null || echo "")
+fi
+
+KB_SIZE=0; KB_TIME=""
+if [ -f "$KDIR/vmlinuz.b" ]; then
+    KB_SIZE=$(stat -c%s "$KDIR/vmlinuz.b" 2>/dev/null || echo 0)
+    KB_TIME=$(date -r "$KDIR/vmlinuz.b" '+%Y-%m-%d %H:%M:%S' 2>/dev/null || echo "")
+fi
+
+ENV_BOOT_OK=$(ab_env_get boot_ok 2>/dev/null || echo "")
+ENV_BOOTCOUNT=$(ab_env_get bootcount 2>/dev/null || echo "0")
+ENV_NEXT_ENTRY=$(ab_env_get next_entry 2>/dev/null || echo "")
+ENV_DEFAULT=$(ab_env_get default 2>/dev/null || echo "0")
+
+OVL_DIR=$(ab_overlay_dir 2>/dev/null || echo "")
+OVL_USED=0
+if [ -n "$OVL_DIR" ] && [ -d "$OVL_DIR" ]; then
+    OVL_USED=$(du -sm "$OVL_DIR" 2>/dev/null | awk '{print $1}')
+fi
+
+case "$CUR" in
+    A) TGT="B" ;;
+    B) TGT="A" ;;
+    *) TGT="unknown" ;;
+esac
+
+if [ "$MODE" = "json" ]; then
+    cat <<EOF
+{
+  "is_ab": true,
+  "disk": "$DISK",
+  "boot_dev": "$BOOT_DEV",
+  "current_slot": "$CUR",
+  "target_slot": "$TGT",
+  "current_partuuid": "$CUR_CMDLINE",
+  "kernel_dir": "$KDIR",
+  "env_path": "$AB_ENV",
+  "slot_a": {
+    "device": "$SLOT_A_DEV",
+    "partuuid": "$PARTUUID_A",
+    "kernel_file": "$KDIR/vmlinuz.a",
+    "kernel_size": $KA_SIZE,
+    "kernel_time": "$KA_TIME"
+  },
+  "slot_b": {
+    "device": "$SLOT_B_DEV",
+    "partuuid": "$PARTUUID_B",
+    "kernel_file": "$KDIR/vmlinuz.b",
+    "kernel_size": $KB_SIZE,
+    "kernel_time": "$KB_TIME"
+  },
+  "grubenv": {
+    "boot_ok": "${ENV_BOOT_OK:-0}",
+    "bootcount": ${ENV_BOOTCOUNT:-0},
+    "next_entry": "${ENV_NEXT_ENTRY}",
+    "default": "${ENV_DEFAULT:-0}"
+  },
+  "overlay": {
+    "dir": "$OVL_DIR",
+    "used_mib": ${OVL_USED:-0}
+  }
+}
+EOF
+    exit 0
+fi
+
+echo "===== A/B 状态 ====="
+echo "磁盘        : ${DISK:-未知}"
+echo "启动槽      : $CUR   (内核命令行: ${CUR_CMDLINE:-未知})"
+echo
+printf "槽 A        : %s  PARTUUID=%s\n" "${SLOT_A_DEV:-无}" "${PARTUUID_A:-无}"
+printf "槽 B        : %s  PARTUUID=%s\n" "${SLOT_B_DEV:-无}" "${PARTUUID_B:-无}"
+echo
+echo "内核        :"
+for f in "$KDIR"/vmlinuz.a "$KDIR"/vmlinuz.b; do
+    [ -f "$f" ] && printf "  %-18s %s 字节  %s\n" "$f" "$(stat -c%s "$f")" "$(date -r "$f" '+%Y-%m-%d %H:%M' 2>/dev/null || true)"
+done
+echo
+echo "grubenv ($AB_ENV):"
+if [ -f "$AB_ENV" ]; then
+    grub-editenv "$AB_ENV" list 2>/dev/null | sed 's/^/  /'
+    case "$ENV_BOOT_OK" in
+        1) echo "  => 上次启动已被标记成功 (回滚计数归零)" ;;
+        *) echo "  => 注意: boot_ok != 1, 说明当前槽尚未被 ab-bootok 确认" ;;
+    esac
+else
+    echo "  (不存在)"
+fi
+echo
+echo "overlay     : $OVL_DIR (${OVL_USED} MiB)"
+
+if [ "$MODE" = "verbose" ]; then
+    echo
+    echo "分区布局:"
+    parted -s -m "$DISK" unit MiB print 2>/dev/null | awk -F: '/^[0-9]+:/{printf "  p%s  %9s MiB  %s\n", $1, $4, $6}' || echo "  (parted 不可用)"
+    echo
+    echo "最近 A/B 日志 ($AB_LOG):"
+    tail -20 "$AB_LOG" 2>/dev/null | sed 's/^/  /' || echo "  (无)"
+fi

@@ -1,0 +1,389 @@
+#!/bin/sh
+# ==========================================================================
+# fsck-guard — 开机前文件系统自检 / 自愈（兜住"强行断电"）
+#
+# 【为什么需要它】
+#   本机经常直接掉电（UPS 断、拔插头、ACPI 关机失败）。ext4 元数据会被打断：
+#   块位图校验和不符、空闲块/inode 计数错、orphan file 未清理、文件指向已被
+#   删除的 inode。2026-10-18 那次只读扫描就在 /dev/sda5(/Lager) 上查出一批
+#   真实损坏，只能人工停掉 18 个容器 + 卸载 /Lager 才修得动（见 state/
+#   fsck-repair-20261018.log）。现在把同一件事固化进开机流程：在挂载之前
+#   先跑一遍 e2fsck / fsck.fat，脏位与元数据不一致在"还没人写"的时候修掉。
+#
+# 【位置与顺序：唯一硬约束，靠"闸门"保证而不是靠数字猜】
+#   实测发现：/Lager 不是 S11fstab 挂的，而是 block 热插拔链挂的——
+#     /etc/hotplug.d/block/10-mount  -> /sbin/block hotplug
+#   这条链在 rcS 之前（约 22s）就把 /Lager 挂好了，所以任何 S 数字都晚了。
+#   因此触发点放在同一条热插拔链的最前面，构造性保证"检查先于挂载"：
+#     /etc/hotplug.d/block/00-fsck-guard  <- 本模块（05 之前，早于 10-mount/15-automount）
+#     10-mount / 15-automount             <- block hotplug 真正挂 /Lager、/mnt/sda1
+#     S97nfs-guard -> S99dockerd          <- NFS / 容器
+#   S10fsck-guard 保留为兜底（没有热插拔事件时也能跑），同一开机只做一次。
+#   fsck 绝不能跑在已挂载的文件系统上：脚本先查 /proc/mounts，
+#   发现已挂载就跳过（并把原因写进日志），不会硬来。
+#
+# 【策略】都可用环境变量覆盖
+#   FSCK_EXT4_DEV      默认 /dev/sda5   （ext4，/Lager + /Lager/docker）
+#   FSCK_ESP_DEV       默认 /dev/sda1   （vfat，ESP/grub）
+#   FSCK_EXT4_MNT      默认 /Lager      （只用于"是否已挂载"的判断）
+#   FSCK_ESP_MNT       默认 /mnt/sda1
+#   FSCK_STATE_DIR     默认 /root/wrtpatch/state（自测时可指向 /tmp 避免污染真实状态）
+#   FSCK_AUTO_FIX      默认 1：preen 修不动时升级 e2fsck -y；0=只报告不升级
+#   FSCK_FULL_INTERVAL 默认 0（关闭）：-f 强制全量。464G 卷全扫要数分钟，
+#                      主路由开机不能这么玩；需要时手工 `wrtpatch fsck full`。
+#                      设为天数则按间隔自动全量（1=每次开机全量）。
+#   FSCK_SOFT_LIMIT    默认 900（秒）：超过只告警，继续等
+#   FSCK_HARD_LIMIT    默认 1800（秒）：超过强制收手（磁盘基本已故障）
+#
+# 【为什么不用 `fsck -a` 一把梭】
+#   - ext4 走 preen(-p)：只修安全项，遇到必须人工判断的情况不瞎猜；
+#     真修不动才按 FSCK_AUTO_FIX 升级到 -y，两级都有日志留证。
+#   - vfat 每次开机 -a：511M / 25 个文件，<1s，顺手清掉掉电留下的脏位。
+#   - 有界等待：本机是主路由，fsck 卡死等于全网断，必须留硬上限。
+#
+# 日志  /root/wrtpatch/state/fsck.log     持久，重启不丢
+#       /tmp/fsck-guard.log               本次开机
+# 结果  /root/wrtpatch/state/fsck.result  `fsck-guard status` 读这个
+# ==========================================================================
+VERSION="1.1.0"
+
+# 开机早期 /etc/TZ 还没被读进环境，日志会写成 UTC（07:35 对 15:35），
+# 事后核对时间线很别扭，这里直接钉死本地时区。
+TZ="${TZ:-CST-8}"
+export TZ
+
+STATE_DIR="${FSCK_STATE_DIR:-/root/wrtpatch/state}"
+LOG="$STATE_DIR/fsck.log"
+TMPLOG="/tmp/fsck-guard.log"
+RESULT="$STATE_DIR/fsck.result"
+LAST_FULL="$STATE_DIR/fsck.last-full"
+BOOT_FLAG="/tmp/.fsck-guard-done"
+LOCK_DIR="/tmp/.fsck-guard.lock"
+
+EXT4_DEV="${FSCK_EXT4_DEV:-/dev/sda5}"
+ESP_DEV="${FSCK_ESP_DEV:-/dev/sda1}"
+DEF_EXT4_MNT="${FSCK_EXT4_MNT:-/Lager}"
+DEF_ESP_MNT="${FSCK_ESP_MNT:-/mnt/sda1}"
+
+AUTO_FIX="${FSCK_AUTO_FIX:-1}"
+FULL_INTERVAL_DAYS="${FSCK_FULL_INTERVAL:-0}"
+SOFT_LIMIT="${FSCK_SOFT_LIMIT:-900}"
+HARD_LIMIT="${FSCK_HARD_LIMIT:-1800}"
+
+mkdir -p "$STATE_DIR" 2>/dev/null
+
+say() {
+	_m="[$(date '+%F %T')] $*"
+	echo "$_m" >>"$LOG"
+	echo "$_m" >>"$TMPLOG"
+	echo "$_m"
+	# 开机早期 console 可能落在 tty0，串口看不见，所以同时写 kmsg
+	echo "<4>fsck-guard: $*" >>/dev/kmsg 2>/dev/null
+}
+
+# 已挂载？(按挂载点精确匹配)
+is_mounted() {
+	awk -v m="$1" '$2 == m { found = 1 } END { exit !found }' /proc/mounts 2>/dev/null
+}
+
+fs_type() {
+	_t=$(blkid -s TYPE -o value "$1" 2>/dev/null)
+	[ -n "$_t" ] || _t=$(blkid "$1" 2>/dev/null | sed -n 's/.*TYPE="\([^"]*\)".*/\1/p')
+	echo "$_t"
+}
+
+# 等待块设备出现（S10 处于内核刚枚举完磁盘的时点，留 20s 余量）
+wait_dev() {
+	_i=0
+	while [ ! -b "$1" ]; do
+		[ "$_i" -ge 20 ] && return 1
+		_i=$((_i + 1))
+		sleep 1
+	done
+	return 0
+}
+
+# 有界执行：返回被调用命令的退出码；超软/硬上限都会留痕。
+# 用标记文件判完成，避免僵尸进程导致 kill -0 永远为真。
+run_bounded() {
+	_rcf="/tmp/.fsck-guard.rc.$$"
+	rm -f "$_rcf"
+	( "$@" ; echo $? >"$_rcf" ) &
+	_pid=$!
+	_el=0
+	while [ ! -f "$_rcf" ]; do
+		sleep 1
+		_el=$((_el + 1))
+		if [ "$_el" -eq "$SOFT_LIMIT" ]; then
+			say "  警告: 已运行 ${_el}s 仍未结束（软上限 ${SOFT_LIMIT}s，继续等；硬上限 ${HARD_LIMIT}s）"
+		fi
+		if [ "$_el" -ge "$HARD_LIMIT" ]; then
+			say "  错误: 超过硬上限 ${HARD_LIMIT}s，强制收手（磁盘可能已故障，需人工介入）"
+			kill -TERM "$_pid" 2>/dev/null
+			sleep 3
+			kill -KILL "$_pid" 2>/dev/null
+			killall -9 e2fsck fsck.fat 2>/dev/null
+			wait "$_pid" 2>/dev/null
+			rm -f "$_rcf"
+			return 124
+		fi
+	done
+	wait "$_pid" 2>/dev/null
+	_rc=$(cat "$_rcf" 2>/dev/null)
+	rm -f "$_rcf"
+	[ -n "$_rc" ] || _rc=1
+	return "$_rc"
+}
+
+# 结果行格式: 2026-10-18 13:20:11 | ext4=/dev/sda5 | rc=0 state=clean dur=21s
+record() {
+	printf '%s | %s | %s\n' "$(date '+%F %T')" "$1" "$2" >>"$RESULT"
+}
+
+# ------------------------------------------------------------------ ext4
+fsck_ext4() {
+	_dev="$1"
+	_mnt="$2"
+
+	if is_mounted "$_mnt"; then
+		say "跳过 ext4 $_dev: $_mnt 已挂载（fsck 不允许在挂载状态下运行）"
+		record "ext4=$_dev" "skip(mounted $_mnt)"
+		return 0
+	fi
+	wait_dev "$_dev" || {
+		if [ -f "$_dev" ]; then
+			say "检测到镜像文件（自测模式）: $_dev"
+		else
+			say "跳过 ext4 $_dev: 设备节点不存在"
+			record "ext4=$_dev" "skip(no-dev)"
+			return 0
+		fi
+	}
+
+	_fs=$(fs_type "$_dev")
+	# 类型探测失败 ≠ 不能查：超级块被打坏时 blkid 也认不出来。
+	# 这种情况下仍然交给 e2fsck 判断（它对非 ext 文件系统只会拒绝，不会写）。
+	if [ -n "$_fs" ] && [ "$_fs" != "ext4" ]; then
+		say "跳过 $_dev: 类型为 '$_fs'，本模块只处理 ext4"
+		record "ext4=$_dev" "skip(type=$_fs)"
+		return 0
+	fi
+	[ -n "$_fs" ] || say "警告: $_dev 类型探测失败（超级块可能已损坏），仍交给 e2fsck 判断"
+
+	# 全量检查节流：第一次运行 / 距上次超过 N 天，才加 -f
+	_force=""
+	_last=$(cat "$LAST_FULL" 2>/dev/null)
+	case "$_last" in *[!0-9]*|"") _last="" ;; esac
+	_now=$(date +%s)
+	if [ "${FORCE_FULL:-0}" = "1" ]; then
+		_force="-f"
+		say "手工强制全量检查（wrtpatch fsck full）"
+	elif [ "$FULL_INTERVAL_DAYS" -gt 0 ]; then
+		if [ -z "$_last" ]; then
+			_force="-f"
+			say "首次运行（无 fsck.last-full），本次做全量检查 -f"
+		elif [ $((_now - _last)) -ge $((FULL_INTERVAL_DAYS * 86400)) ]; then
+			_force="-f"
+			say "距上次全量检查已超过 ${FULL_INTERVAL_DAYS} 天，本次做全量检查 -f"
+		fi
+	fi
+
+	# preen：只做安全修复；顺手把上次掉电留下的 journal 重放掉
+	say "e2fsck ${_force} -p $_dev 开始"
+	_t0=$(date +%s)
+	run_bounded e2fsck $_force -p "$_dev"
+	rc=$?
+	_dur=$(( $(date +%s) - _t0 ))
+	_state="?"
+	_escalated="no"
+	# 类型探测失败时的兜底：e2fsck 用 bad magic 明确拒绝，说明根本不是 ext，
+	# 此时不做任何升级（-y 也修不了，只会白白刷日志）。
+	if [ "$rc" -eq 8 ] && tail -8 "$LOG" | grep -qi 'bad magic'; then
+		say "$_dev 不是 ext 文件系统（e2fsck: bad magic），跳过"
+		record "ext4=$_dev" "skip(not-ext4)"
+		return 0
+	fi
+	case "$rc" in
+		0) _state="clean" ;;
+		1) _state="fixed" ;;
+		2) _state="fixed(reboot-needed)" ;;
+		4|8|16|32)
+			_state="unfixed"
+			if [ "$AUTO_FIX" = "1" ]; then
+				say "preen 未能全部修复(rc=$rc)，升级为 e2fsck -y $_dev"
+				_escalated="yes"
+				run_bounded e2fsck -y "$_dev"
+				rc=$?
+				_dur=$(( $(date +%s) - _t0 ))
+				case "$rc" in
+					0) _state="fixed(-y)" ;;
+					1) _state="fixed(-y)" ;;
+					2) _state="fixed(-y,reboot-needed)" ;;
+					*) _state="FAILED(-y rc=$rc)" ;;
+				esac
+			fi
+			;;
+		*) _state="FAILED(rc=$rc)" ;;
+	esac
+
+	say "e2fsck $_dev 结果: rc=$rc state=$_state 耗时=${_dur}s 升级=$_escalated"
+	[ "$_state" = "clean" ] || say "  修复明细见上方 e2fsck 输出（同一份日志）"
+	record "ext4=$_dev" "rc=$rc state=$_state dur=${_dur}s force=${_force:--} escalate=$_escalated"
+
+	# 全量检查成功就记时间；失败则保留旧时间戳，下次开机继续全量
+	if [ -n "$_force" ] && [ "$rc" -le 2 ]; then
+		date +%s >"$LAST_FULL"
+	fi
+	return 0
+}
+
+# ------------------------------------------------------------------ vfat
+fsck_esp() {
+	_dev="$1"
+	_mnt="$2"
+
+	if is_mounted "$_mnt"; then
+		say "跳过 vfat $_dev: $_mnt 已挂载"
+		record "esp=$_dev" "skip(mounted $_mnt)"
+		return 0
+	fi
+	wait_dev "$_dev" || { say "跳过 vfat $_dev: 设备节点不存在"; record "esp=$_dev" "skip(no-dev)"; return 0; }
+
+	_fs=$(fs_type "$_dev")
+	if [ "$_fs" != "vfat" ]; then
+		say "跳过 $_dev: 类型为 '${_fs:-未知}'，ESP 只处理 vfat"
+		record "esp=$_dev" "skip(type=${_fs:-unknown})"
+		return 0
+	fi
+
+	say "fsck.fat -a $_dev 开始"
+	_t0=$(date +%s)
+	run_bounded fsck.fat -a "$_dev"
+	rc=$?
+	_dur=$(( $(date +%s) - _t0 ))
+	case "$rc" in
+		0) _state="clean" ;;
+		1) _state="fixed" ;;
+		2) _state="fixed(reboot-needed)" ;;
+		*) _state="FAILED(rc=$rc)" ;;
+	esac
+	say "fsck.fat $_dev 结果: rc=$rc state=$_state 耗时=${_dur}s"
+	record "esp=$_dev" "rc=$rc state=$_state dur=${_dur}s"
+	return 0
+}
+
+# ------------------------------------------------------------------ 命令
+cmd_boot() {
+	# 同一开机只做一次：热插拔钩子和 S10 兜底都调这里，先到先做
+	[ -e "$BOOT_FLAG" ] && return 0
+
+	# 多个 block 事件（sda / sda1 / sda5）可能几乎同时进钩子，只放一个实例进去跑，
+	# 其余等它结束直接返回，避免两把 e2fsck 同时啃同一块盘。
+	if ! mkdir "$LOCK_DIR" 2>/dev/null; then
+		_i=0
+		while [ -d "$LOCK_DIR" ] && [ "$_i" -lt "$HARD_LIMIT" ]; do
+			_i=$((_i + 1))
+			sleep 1
+		done
+		return 0
+	fi
+
+	: >"$BOOT_FLAG"
+	: >"$RESULT"
+
+	say "===================== 开机 fsck 开始 (v$VERSION) ====================="
+	say "ext4=$EXT4_DEV  esp=$ESP_DEV  auto_fix=$AUTO_FIX  全量间隔=${FULL_INTERVAL_DAYS}天"
+
+	fsck_ext4 "$EXT4_DEV" "$DEF_EXT4_MNT"
+	fsck_esp "$ESP_DEV" "$DEF_ESP_MNT"
+
+	say "本次结果:"
+	while IFS='|' read -r _ts _k _v; do
+		[ -n "$_k" ] || continue
+		say "  $(echo "$_k" | sed 's/^ *//;s/ *$//') -> $(echo "$_v" | sed 's/^ *//;s/ *$//')"
+	done <"$RESULT"
+	sync
+	say "===================== 开机 fsck 结束 ====================="
+	rmdir "$LOCK_DIR" 2>/dev/null
+	return 0
+}
+
+cmd_check() {
+	# 只读自检：-n 不做任何写操作；已挂载则拒绝
+	: >"$RESULT"
+	say "=== 只读自检 (e2fsck -fn) ==="
+	if is_mounted "$DEF_EXT4_MNT"; then
+		say "$DEF_EXT4_MNT 已挂载，无法只读检查（先卸载或直接看开机日志）"
+		record "ext4=$EXT4_DEV" "skip(mounted)"
+		return 1
+	fi
+	if [ -b "$EXT4_DEV" ]; then
+		wait_dev "$EXT4_DEV" || { say "$EXT4_DEV 不存在"; return 1; }
+	elif [ ! -f "$EXT4_DEV" ]; then
+		say "$EXT4_DEV 不存在（既不是块设备也不是镜像文件）"
+		return 1
+	fi
+	say "e2fsck -fn $EXT4_DEV 开始"
+	run_bounded e2fsck -fn "$EXT4_DEV"
+	rc=$?
+	say "e2fsck -fn 结果: rc=$rc（0=干净 1/2=可修 4=需修复 8=运行错误）"
+	record "ext4=$EXT4_DEV" "check rc=$rc"
+	return 0
+}
+
+cmd_full() {
+	# 手工全量：-f 强扫（464G 卷要几分钟），只在已卸载时可用
+	: >"$RESULT"
+	say "=== 手工全量检查 (e2fsck -f -p) ==="
+	FORCE_FULL=1
+	fsck_ext4 "$EXT4_DEV" "$DEF_EXT4_MNT"
+	say "本次结果:"
+	sed 's/^/  /' "$RESULT"
+	return 0
+}
+
+cmd_status() {
+	echo "fsck-guard v$VERSION"
+	echo "  设备      : ext4=$EXT4_DEV ($DEF_EXT4_MNT)  esp=$ESP_DEV ($DEF_ESP_MNT)"
+	echo "  策略      : e2fsck -p -> 修不动时$( [ "$AUTO_FIX" = "1" ] && echo '升级 -y' || echo '只报告' )；全量间隔=$([ "$FULL_INTERVAL_DAYS" -gt 0 ] && echo "${FULL_INTERVAL_DAYS}天" || echo '关闭(仅手工)')；软/硬上限=${SOFT_LIMIT}/${HARD_LIMIT}s"
+	echo "  开机闸门  : $([ -e /etc/hotplug.d/block/00-fsck-guard ] && echo 'hotplug 00-fsck-guard ok（早于 10-mount）' || echo 'hotplug 闸门缺失')"
+	echo "  兜底钩子  : $([ -e /etc/rc.d/S10fsck-guard ] && echo 'S10fsck-guard ok' || echo 'S10fsck-guard 缺失')"
+	echo "  fstab fsck: $(uci get fstab.@global[0].check_fs 2>/dev/null | sed 's/^0$/off(由本模块接管)/;s/^1$/on(注意双检)/')"
+	if [ -f "$LAST_FULL" ]; then
+		echo "  上次全量  : $(date -d "@$(cat "$LAST_FULL")" '+%F %T' 2>/dev/null || echo "epoch $(cat "$LAST_FULL")")"
+	elif [ "$FULL_INTERVAL_DAYS" -gt 0 ]; then
+		echo "  上次全量  : 从未（下次开机做 -f）"
+	else
+		echo "  上次全量  : 从未（自动全量已关闭，可用 fsck-guard full 手工做）"
+	fi
+	if [ -s "$RESULT" ]; then
+		echo "  最近结果  :"
+		sed 's/^/    /' "$RESULT"
+	else
+		echo "  最近结果  : 无（等下次开机）"
+	fi
+	if [ -s "$LOG" ]; then
+		echo "  日志尾部  : $LOG"
+		tail -6 "$LOG" | sed 's/^/    /'
+	fi
+}
+
+case "${1:-status}" in
+	boot)   cmd_boot ;;
+	check)  cmd_check ;;
+	full)   cmd_full ;;
+	status) cmd_status ;;
+	*)
+		cat <<EOF
+fsck-guard v$VERSION — 开机前文件系统自检/自愈
+
+  boot     开机调用（hotplug 闸门 + S10 兜底，幂等：同一开机只跑一次）
+  check    只读自检（e2fsck -fn，要求未挂载）
+  full     手工全量（e2fsck -f -p，要求未挂载，464G 卷需数分钟）
+  status   上次结果、策略与钩子状态
+
+日志: $LOG
+EOF
+		exit 1
+		;;
+esac

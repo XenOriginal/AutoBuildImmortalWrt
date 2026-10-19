@@ -1,0 +1,80 @@
+# ============================================================================
+# A/B dual-slot GRUB menu — deterministic version
+#
+# Layout (fixed by ab-layout.sh):
+#   (hd0,gpt1) = FAT32 /boot, contains /boot/vmlinuz.a|b, /boot/grub/grub.cfg,
+#                /boot/grub/grubenv, /efi/boot/bootx64.efi
+#
+# This menu deliberately does NOT use `search` at boot time.  The old image
+# was built without the search module and printed "can't find command search"
+# on every boot.  The ESP is always (hd0,gpt1) on this single-disk host.
+#
+# A/B state lives in /boot/grub/grubenv and is read/written with
+# load_env/save_env.  The GRUB build patch embeds the loadenv module into
+# both core.img and bootx64.efi.  If that module is missing, the menu still
+# boots slot A/B manually; automatic rollback is then unavailable.
+#
+# Placeholders replaced by ab-layout.sh / ab-upgrade --update-boot:
+#   @@PARTUUID_A@@ @@PARTUUID_B@@ @@BOOTOPTS@@ @@TIMEOUT@@ @@BAUD@@
+# ============================================================================
+
+serial --unit=0 --speed=@@BAUD@@ --word=8 --parity=no --stop=1 --rtscts=off
+terminal_input console serial
+terminal_output console serial
+
+set timeout=@@TIMEOUT@@
+set default=0
+set abroot=(hd0,gpt1)
+set abenv=($abroot)/boot/grub/grubenv
+
+# One-shot next_entry
+if [ -s $abenv ]; then
+  load_env -f $abenv
+fi
+
+if [ -n "${next_entry}" ]; then
+  set default="${next_entry}"
+  set next_entry=
+  save_env -f $abenv next_entry
+fi
+
+# Failed-boot fallback: boot_ok != 1 -> bootcount 0->1->2 -> switch default.
+if [ "${boot_ok}" = "1" ]; then
+  set bootcount=0
+else
+  if [ "${bootcount}" = "2" ]; then
+    if [ "${default}" = "0" ]; then
+      set default=1
+    else
+      set default=0
+    fi
+    set bootcount=0
+  else
+    if [ "${bootcount}" = "1" ]; then
+      set bootcount=2
+    else
+      set bootcount=1
+    fi
+  fi
+  save_env -f $abenv default bootcount boot_ok
+fi
+
+menuentry "ImmortalWrt (slot A)" --id slot-a {
+set root=(hd0,gpt1)
+linux /boot/vmlinuz.a root=PARTUUID=@@PARTUUID_A@@ rootwait @@BOOTOPTS@@
+}
+
+menuentry "ImmortalWrt (slot B)" --id slot-b {
+set root=(hd0,gpt1)
+linux /boot/vmlinuz.b root=PARTUUID=@@PARTUUID_B@@ rootwait @@BOOTOPTS@@
+}
+
+menuentry "ImmortalWrt (slot A, failsafe)" --id slot-a-failsafe {
+set root=(hd0,gpt1)
+linux /boot/vmlinuz.a root=PARTUUID=@@PARTUUID_A@@ rootwait failsafe=true @@BOOTOPTS@@
+}
+
+menuentry "ImmortalWrt (slot B, failsafe)" --id slot-b-failsafe {
+set root=(hd0,gpt1)
+linux /boot/vmlinuz.b root=PARTUUID=@@PARTUUID_B@@ rootwait failsafe=true @@BOOTOPTS@@
+}

@@ -1,0 +1,28 @@
+#!/bin/sh /etc/rc.common
+# /etc/init.d/nfs-guard
+#   开机 S97: 快速尝试挂载 NFS —— 早于 S99dockerd，避免容器绑到本地空目录
+#             只等 20s，NAS 没上线就先放行，剩余由 S99nfs-bootwait 后台补齐
+#   关机 K86: 停容器 + 清占用 + 有界卸载 —— 早于 K90network，避免断网后 hard 挂载卡死
+# 实际逻辑全部在 /usr/local/bin/nfs-guard（由 wrtpatch 统一管理）
+START=97
+STOP=86
+
+boot() {
+	start
+}
+
+start() {
+	[ -x /usr/local/bin/nfs-guard ] || {
+		echo "nfs-guard: /usr/local/bin/nfs-guard 不存在，跳过挂载"
+		return 1
+	}
+	NFS_WAIT="${NFS_WAIT_BOOT:-20}" /usr/local/bin/nfs-guard mount
+	# 返回非 0 不算启动失败：bootwait 会继续补齐
+	return 0
+}
+
+stop() {
+	[ -x /usr/local/bin/nfs-guard ] || return 0
+	NFS_SHUTDOWN=1 /usr/local/bin/nfs-guard umount
+	return 0
+}

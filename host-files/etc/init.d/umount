@@ -1,0 +1,130 @@
+#!/bin/sh /etc/rc.common
+# Copyright (C) 2006 OpenWrt.org
+#
+# [wrtpatch] 本文件由 wrtpatch 接管，原版备份在 /root/wrtpatch/legacy/umount.init.orig
+# ---------------------------------------------------------------------------
+# 原版只有两句:
+#     stop() { sync; /bin/umount -a -d -r }
+#
+# 本机实测的两个问题:
+#
+# 1) 关机卡死（2026-10-18 00:19 重启）
+#    6 个 hard NFS 挂载，若 K86 没能全部卸载（进程占用只能惰性摘除），
+#    superblock 仍然活着。这里第一条 sync 会去回写这些 NFS 脏页，而
+#    K90network 已经先拆了网卡 —— hard 挂载永不放弃，sync 进入 D 状态，
+#    SIGKILL 无效，procd 等不到脚本退出，"重启"永远停在这一步:
+#        1826s br-lan disabled
+#        1889s nfs: server 10.0.0.10 not responding, still trying
+#
+# 2) poweroff 只 halt（2026-10-18 00:40）
+#    /dev、/tmp 都是独立 tmpfs，`umount -a` 会一并卸掉。之后 K98powerguard
+#    既读不到标记，也打不开 /dev/port 写 S5 —— 于是静默失败。
+#
+# 3) poweroff 整条链停在 K90umount（2026-10-18 01:31）
+#    K86 已经 0 残留，presync 判定"允许全局 sync"，之后就再无任何进展，
+#    连 K98 都没执行到。procd 会等 K 脚本退出（SIGKILL 对 D 状态无效），
+#    于是永久挂住。本机 CONFIG_DETECT_HUNG_TASK 是关的，所以内核一声不响。
+#
+# 因此改成:
+#   1) NFS 仍有挂载 -> 跳过全局 sync（避免永久阻塞），只惰性卸载非保护挂载
+#   2) 不再用 `umount -a`，改为显式遍历并按挂载深度倒序卸载
+#   3) 保护 /、/proc、/sys、/dev、/tmp、/overlay、/rom —— 尤其 /dev，
+#      K98 的 S5 断电依赖 /dev/port
+#   4) sync / umount 全部放后台并限时等待，超时继续关机，绝不阻塞关机链
+#   5) 全程写 /dev/kmsg 打点：/dev/console 在有 X 桌面的机器上落到 tty0，
+#      串口一个字都看不到；kmsg 才是唯一可靠的可见通道
+#   6) 总预算压到 8s（正常关机链只给 15s，留足余量给 procd）
+# ---------------------------------------------------------------------------
+STOP=90
+
+# 这些挂载点永不卸载（前缀匹配）
+PROTECT="/ /proc /sys /dev /tmp /overlay /rom"
+# 卸载阶段总预算（秒）
+UMOUNT_BUDGET=8
+
+restart() {
+	:
+}
+
+um_log() {
+	_m="wrtpatch-umount: $*"
+	[ -e /dev/console ] && echo "$_m" >/dev/console 2>/dev/null
+	echo "$_m" >/dev/kmsg 2>/dev/null
+}
+
+is_protected() {
+	for _p in $PROTECT; do
+		[ "$1" = "$_p" ] && return 0
+		case "$1" in
+			"$_p"/*) [ "$_p" = "/" ] || return 0 ;;
+		esac
+	done
+	# 精确匹配 "/" 之外，根下的普通目录（/Lager、/nfs 等）允许卸载
+	return 1
+}
+
+uptime_s() { awk '{printf "%d", $1}' /proc/uptime 2>/dev/null; }
+
+# 后台执行 + 限时等待。超时返回非 0 并继续，不阻塞关机。
+run_bounded() { # $1=秒数，其余=命令
+	_to="$1"; shift
+	"$@" >/dev/null 2>&1 &
+	_p=$!
+	_i=0
+	while [ "$_i" -lt "$_to" ]; do
+		kill -0 "$_p" 2>/dev/null || return 0
+		sleep 1
+		_i=$((_i + 1))
+	done
+	um_log "'$*' 超过 ${_to}s 未返回，跳过并继续关机"
+	return 1
+}
+
+stop() {
+	um_log "进入 K90umount（同步卸载阶段）"
+
+	# 有没有 NFS 残留决定能不能做全局 sync
+	_nfs=0
+	[ -x /usr/local/bin/nfs-guard ] && ! /usr/local/bin/nfs-guard presync >/dev/null 2>&1 && _nfs=1
+
+	if [ "$_nfs" = "1" ]; then
+		um_log "NFS 仍有挂载，跳过全局 sync（否则永久阻塞）"
+	else
+		um_log "无 NFS 残留，执行全局 sync（上限 6s）"
+		run_bounded 6 /bin/sync
+	fi
+
+	# 倒序卸载（/proc/mounts 是先父后子，倒着来先卸子挂载）。
+	_deadline=$(( $(uptime_s) + UMOUNT_BUDGET ))
+	# shellcheck disable=SC2046
+	_mps=$(awk '{a[NR]=$2} END{for(i=NR;i>=1;i--) print a[i]}' /proc/mounts)
+	_ok=0
+	for _mp in $_mps; do
+		[ "$(uptime_s)" -ge "$_deadline" ] && {
+			um_log "已达 ${UMOUNT_BUDGET}s 预算，剩余挂载改为惰性摘除"
+			break
+		}
+		is_protected "$_mp" && continue
+		case "$_mp" in
+			*"/docker/overlay2/"*|*"/netns/"*)
+				# 容器层/网络命名空间：直接惰性摘除，立即返回
+				/bin/umount -l "$_mp" >/dev/null 2>&1
+				continue
+				;;
+		esac
+		# 每个挂载最多等 1s，超时立刻转惰性摘除
+		if run_bounded 1 /bin/umount "$_mp"; then
+			_ok=$((_ok + 1))
+		else
+			run_bounded 1 /bin/umount -l "$_mp"
+		fi
+	done
+
+	# NFS 若还有残留，惰性摘除（不再 sync，脏页交给服务端超时回收）
+	for _mp in $(awk '$3 ~ /^nfs/ {print $2}' /proc/mounts); do
+		run_bounded 1 /bin/umount -l "$_mp"
+	done
+
+	um_log "同步卸载阶段结束：卸载 $_ok 个，剩余挂载 $(wc -l </proc/mounts) 条（保留 /dev /tmp 供 K98 断电）"
+	return 0
+}

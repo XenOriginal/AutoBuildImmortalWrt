@@ -1,0 +1,161 @@
+name: Build ImmortalWrt x86-64 Host (A/B production)
+
+# Single-purpose build: Inspur AliMoC-MD-02-25G only.
+# The old multi-architecture upstream tree was intentionally removed.
+on:
+  push:
+    branches:
+      - master
+    paths:
+      - 'x86-64-host/**'
+      - 'host-files/**'
+      - 'qat-src/**'
+      - '.github/workflows/build-host.yml'
+  workflow_dispatch:
+    inputs:
+      imm_branch:
+        description: 'ImmortalWrt source branch'
+        required: true
+        default: 'openwrt-25.12'
+      imm_commit:
+        description: 'Pinned ImmortalWrt commit (recommended for reproducible builds)'
+        required: true
+        default: '214e26e407172790c0045f59afe03a9715608ef8'
+      profile:
+        description: 'Rootfs partition size (MiB)'
+        required: true
+        default: '1024'
+      include_docker:
+        description: 'Include Docker / containerd / compose'
+        required: true
+        default: 'yes'
+        type: choice
+        options:
+          - 'yes'
+          - 'no'
+      features:
+        description: 'Optional extra feature fragments, comma-separated (normally empty)'
+        required: false
+        default: ''
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 350
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+                      /opt/hostedtoolcache/CodeQL /usr/local/share/boost || true
+          sudo apt-get clean
+          sudo mkdir -p /mnt/build && sudo chown -R "$USER":"$USER" /mnt/build
+          df -h / /mnt
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq \
+            build-essential ccache ecj fastjar file g++ gawk gettext git \
+            java-propose-classpath libelf-dev libncurses5-dev libncursesw5-dev \
+            libssl-dev python3 python3-setuptools python3-dev rsync subversion \
+            swig time xsltproc zlib1g-dev unzip wget genisoimage libncurses-dev \
+            default-jre-headless ca-certificates-java flex bison bc cpio
+
+      - name: Build in Ubuntu 22.04 container
+        env:
+          IMM_BRANCH: ${{ inputs.imm_branch || 'openwrt-25.12' }}
+          IMM_COMMIT: ${{ inputs.imm_commit || '214e26e407172790c0045f59afe03a9715608ef8' }}
+          PROFILE: ${{ inputs.profile || '1024' }}
+          INCLUDE_DOCKER: ${{ inputs.include_docker || 'yes' }}
+          FEATURES: ${{ inputs.features || '' }}
+          FW_VARIANT: 'clean-ab'
+        run: |
+          set -e
+          chmod +x x86-64-host/build-source.sh x86-64-host/apply-features.sh
+          docker run --rm \
+            --user root --privileged \
+            -v "$PWD:/work" \
+            -v "$PWD/qat-src:/host-qat:ro" \
+            -v "$PWD/host-files:/host-files:ro" \
+            -e IMM_BRANCH="$IMM_BRANCH" \
+            -e IMM_COMMIT="$IMM_COMMIT" \
+            -e PROFILE="$PROFILE" \
+            -e INCLUDE_DOCKER="$INCLUDE_DOCKER" \
+            -e FEATURES="$FEATURES" \
+            -e FW_VARIANT="$FW_VARIANT" \
+            -e FORCE_UNSAFE_CONFIGURE=1 \
+            -w /work \
+            ubuntu:22.04 \
+            /bin/bash -c '
+              set -e
+              apt-get update -qq
+              DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
+                build-essential ccache ecj fastjar file g++ gawk gettext git \
+                java-propose-classpath libelf-dev libncurses5-dev libncursesw5-dev \
+                libssl-dev python3 python3-setuptools python3-dev rsync subversion \
+                swig time xsltproc zlib1g-dev unzip wget sudo bzip2 gzip tar patch \
+                perl cpio bc genisoimage libncurses-dev default-jre-headless \
+                ca-certificates-java flex bison
+              bash /work/x86-64-host/build-source.sh
+            '
+
+      - name: Verify manifest and images
+        run: |
+          set -e
+          MANIFEST=$(ls -1 bin/targets/x86/64/*-1024.manifest 2>/dev/null | head -1 || true)
+          [ -n "$MANIFEST" ] || { echo "::error::manifest not found"; exit 1; }
+          echo "manifest: $MANIFEST ($(wc -l < "$MANIFEST") packages)"
+          for p in \
+            kmod-crypto-qat-common kmod-crypto-qat-c3xxx qat-firmware-c3xxx \
+            kmod-kvm-x86 kmod-kvm-intel kmod-vfio kmod-vfio-pci \
+            kmod-vhost-net qemu-x86_64-softmmu qemu-img \
+            fstrim intel-microcode efibootmgr efivar kmod-fs-efivarfs \
+            kmod-itco-wdt kmod-hwmon-coretemp smartmontools \
+            grub2-editenv grub2-bios-setup; do
+            grep -qE "^${p} " "$MANIFEST" || { echo "::error::missing package: $p"; exit 1; }
+          done
+          # reverse assertion: the wrong QAT driver must not be present
+          if grep -qE '^kmod-crypto-qat-dh895xcc ' "$MANIFEST"; then
+            echo "::error::wrong QAT driver (dh895xcc) found in manifest"; exit 1
+          fi
+          for f in bin/targets/x86/64/*-combined.img.gz bin/targets/x86/64/*-combined-efi.img.gz; do
+            [ -f "$f" ] || { echo "::error::missing image: $f"; exit 1; }
+            ls -lh "$f"
+          done
+
+      - name: Upload firmware artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ImmortalWrt-x86-64-Host-CleanAB
+          path: |
+            bin/targets/x86/64/*.img.gz
+            bin/targets/x86/64/*.manifest
+            bin/targets/x86/64/sha256sums
+            host-final.config
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Publish latest release
+        uses: softprops/action-gh-release@v2
+        if: success()
+        with:
+          tag_name: latest-clean-ab
+          name: "ImmortalWrt 25.12 Host Clean-AB (latest)"
+          body: |
+            ## Inspur AliMoC-MD-02-25G A/B production image
+            - commit: `${{ github.sha }}`
+            - variant: `clean-ab` (A/B + fsck/nfs/power reliability + KVM/VFIO/QEMU)
+            - QAT: **C3XXX (8086:19e2)** — `qat_c3xxx.ko` + `qat_c3xxx.bin`
+            - both Legacy and UEFI combined images included
+          files: |
+            bin/targets/x86/64/*.img.gz
+            bin/targets/x86/64/*.manifest
+            bin/targets/x86/64/sha256sums
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

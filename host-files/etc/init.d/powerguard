@@ -1,0 +1,27 @@
+#!/bin/sh /etc/rc.common
+# ==========================================================================
+# powerguard 关机钩子
+#
+#   STOP=98 : 关机时**最后**执行。本机 K 序列是"按编号从小到大"执行的，
+#             实测顺序为 K05.. K10.. K50.. K85.. K86nfs-guard K89log
+#             K90boot K90network K90sysfixtime K90umount，所以只有 98 才真正
+#             排在 K90umount 之后（v1 用的 K05 其实是最先执行，会连容器都
+#             没停就去断电，已纠正）。
+#
+#             放在最后的理由：此时业务已停、NFS 已卸、数据已落盘，
+#             才允许写 S5 断电。
+#
+#   走到这里还有第二个含义：**整条关机链算是走完了**。
+#   K60 布防的看门狗一直在等这个信号（v3.3 起 K86 不再提前解除看门狗，
+#   否则 K90umount 卡死时没人兜底）。所以先落 shutdown.done 再断电。
+# ==========================================================================
+START=
+STOP=98
+
+stop() {
+	mkdir -p /root/wrtpatch/state 2>/dev/null
+	touch /root/wrtpatch/state/shutdown.done
+	[ -x /usr/local/bin/powerguard ] || return 0
+	/usr/local/bin/powerguard fallback
+	return 0
+}
