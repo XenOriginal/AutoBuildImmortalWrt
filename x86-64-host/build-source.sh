@@ -232,6 +232,7 @@ else
       etc/sysctl.conf etc/modules.d/30-tcp-bbr etc/ab-bootopts \
       etc/uci-defaults/10-ab-clean-storage.sh \
       etc/init.d/fsck-guard etc/init.d/nfs-guard etc/init.d/nfs-guard-start \
+      etc/init.d/microcode-load \
       etc/init.d/nfs-guard-dockstop etc/init.d/nfs-bootwait \
       etc/init.d/powerguard etc/init.d/hw-watchdog etc/init.d/hw-healthd \
       etc/init.d/hw-tune etc/init.d/hw-storage-guard etc/init.d/umount \
@@ -240,7 +241,7 @@ else
       usr/sbin/hw-health usr/lib/wrtpatch/poweroff.wrapper \
       usr/sbin/ab-upgrade usr/sbin/ab-status usr/sbin/ab-switch usr/sbin/sysupgrade \
       usr/lib/ab-lib.sh usr/lib/ab-grub.cfg.tmpl etc/init.d/ab-bootok \
-      etc/rc.d/S10fsck-guard etc/rc.d/S95ab-bootok etc/rc.d/S96hw-watchdog \
+      etc/rc.d/S10fsck-guard etc/rc.d/S20microcode-load etc/rc.d/S95ab-bootok etc/rc.d/S96hw-watchdog \
       etc/rc.d/S97hw-healthd etc/rc.d/S97nfs-guard etc/rc.d/K86nfs-guard \
       etc/rc.d/K60nfs-guard-dockstop etc/rc.d/S99nfs-bootwait \
       etc/rc.d/S99nfs-guard-start etc/rc.d/K98powerguard; do
@@ -1105,13 +1106,14 @@ for rd in $ROOTFS_DIRS; do
         www/luci-static/resources/view/system/flash.js \
         etc/sysctl.conf etc/ab-bootopts etc/uci-defaults/10-ab-clean-storage.sh \
         etc/init.d/fsck-guard etc/init.d/nfs-guard etc/init.d/nfs-guard-start \
+        etc/init.d/microcode-load \
         etc/init.d/nfs-guard-dockstop etc/init.d/nfs-bootwait \
         etc/init.d/powerguard etc/init.d/hw-watchdog etc/init.d/hw-healthd \
         etc/init.d/hw-tune etc/init.d/hw-storage-guard etc/init.d/umount \
         etc/hotplug.d/block/00-fsck-guard \
         usr/local/bin/fsck-guard usr/local/bin/nfs-guard usr/local/bin/powerguard \
         usr/sbin/hw-health usr/lib/wrtpatch/poweroff.wrapper \
-        etc/rc.d/S10fsck-guard etc/rc.d/S95ab-bootok etc/rc.d/S96hw-watchdog \
+        etc/rc.d/S10fsck-guard etc/rc.d/S20microcode-load etc/rc.d/S95ab-bootok etc/rc.d/S96hw-watchdog \
         etc/rc.d/S97hw-healthd etc/rc.d/S97nfs-guard etc/rc.d/K86nfs-guard \
         etc/rc.d/K60nfs-guard-dockstop etc/rc.d/S99nfs-bootwait \
         etc/rc.d/S99nfs-guard-start etc/rc.d/K98powerguard; do

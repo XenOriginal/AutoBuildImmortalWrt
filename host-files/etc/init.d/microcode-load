@@ -1,0 +1,13 @@
+#!/bin/sh /etc/rc.common
+# Late-load Intel microcode every boot.  CONFIG_MICROCODE_LATE_LOADING=y;
+# the intel-microcode package supplies /lib/firmware/intel-ucode.
+START=20
+
+start() {
+    [ -d /lib/firmware/intel-ucode ] || return 0
+    [ -w /sys/devices/system/cpu/microcode/reload ] || return 0
+    echo 1 > /sys/devices/system/cpu/microcode/reload 2>/dev/null || return 0
+    logger -t microcode-load "requested late microcode reload"
+}
+
+stop() { :; }
