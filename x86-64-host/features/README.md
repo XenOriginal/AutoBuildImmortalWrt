@@ -17,3 +17,5 @@ can be read back.  The build script additionally checks the final kernel
 dropped fails the build instead of shipping.
 
 Current defaults: `enabled.txt`.
+
+<!-- build trigger 20261019T052437Z -->
