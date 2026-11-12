@@ -36,3 +36,6 @@
 
 # 内核 hung_task / softlockup 可观测性
 55-lockup-detect
+
+# 蓝牙栈 (BT 内核模块 + BlueZ 用户态)
+60-bluetooth
