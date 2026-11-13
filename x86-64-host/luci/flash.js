@@ -250,9 +250,9 @@ return view.extend({
 				])
 			]));
 
-			body.push(E('div', { 'class': 'alert-message info' }, [
+			body.push(E('div', { 'class': 'alert-message info' },
 				_('新固件将写入 <strong>备用槽 (槽 %s)</strong>。写入完成后当前系统不受影响，您可随时安排重启切换。').format(targetSlot)
-			]));
+			));
 
 			const confirmBtn = E('button', {
 				'class': 'btn cbi-button-action important',
@@ -467,9 +467,9 @@ E('button', {
 // 固件升级区域
 E('div', { 'class': 'cbi-section', 'style': 'margin-top: 25px; padding-top: 15px; border-top: 1px dashed var(--ab-line);' }, [
 E('h3', {}, _('🚀 A/B 双槽平滑升级 (写入备用槽 %s)').format(tgtSlot)),
-E('p', { 'class': 'cbi-value-description' }, [
+E('p', { 'class': 'cbi-value-description' },
 _('请上传 x86 Combined 固件镜像（支持 .img 或 .img.gz 格式，如 <code>immortalwrt-x86-64-generic-squashfs-combined*.img.gz</code>）。固件将自动写入备用槽，升级全程不影响当前网络运行。')
-]),
+),
 E('div', { 'style': 'margin-top: 15px;' }, [
 E('button', {
 'class': 'btn cbi-button-action important',
