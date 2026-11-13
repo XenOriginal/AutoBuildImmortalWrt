@@ -355,108 +355,132 @@ return view.extend({
 	},
 
 	// 渲染 A/B 专属看板组件
-	renderAbSection(abInfo) {
-		const curSlot = abInfo.current_slot || 'A';
-		const tgtSlot = abInfo.target_slot || 'B';
-		const slotA = abInfo.slot_a || {};
-		const slotB = abInfo.slot_b || {};
-		const grub = abInfo.grubenv || {};
+renderAbSection(abInfo) {
+const curSlot = abInfo.current_slot || 'A';
+const tgtSlot = abInfo.target_slot || 'B';
+const slotA = abInfo.slot_a || {};
+const slotB = abInfo.slot_b || {};
+const grub = abInfo.grubenv || {};
+const conf = abInfo.confirm || {};
+const pending = (grub.pending === '1' || grub.pending === 1);
+const isSafe = !pending && ((conf.state === 'locked') || (grub.boot_ok == '1'));
+const bootCount = grub.bootcount || 0;
+const remain = parseInt(conf.remaining_sec, 10) || 0;
 
-		const conf = abInfo.confirm || {};
-		const pending = (grub.pending === '1' || grub.pending === 1);
-		const isSafe = !pending && ((conf.state === 'locked') || (grub.boot_ok == '1'));
-		const bootCount = grub.bootcount || 0;
-		const remain = parseInt(conf.remaining_sec, 10) || 0;
+const fmtSpan = function(sec) {
+sec = Math.max(0, sec | 0);
+const h = Math.floor(sec / 3600), m = Math.floor((sec % 3600) / 60);
+return h > 0 ? '%dh%dm'.format(h, m) : '%dm'.format(m);
+};
 
-		// 主题自适应配色：半透明叠加在当前主题背景上，明/暗主题都可读
-		const cardStyle = 'border:1px solid var(--ab-card-bd, rgba(127,127,127,.28)); border-radius:6px; padding:15px; margin-bottom:15px; background:var(--ab-card-bg, rgba(127,127,127,.07)); color:inherit;';
-		const cardActive = 'border-color:#28a745; background:rgba(40,167,69,.10);';
-		const badge = function(text, bg) {
-			return E('span', { 'style': 'background:' + bg + '; color:#fff; padding:3px 8px; border-radius:12px; font-weight:bold; font-size:12px; white-space:nowrap;' }, [ text ]);
-		};
-		const fmtSpan = function(sec) {
-			sec = Math.max(0, sec | 0);
-			const h = Math.floor(sec / 3600), m = Math.floor((sec % 3600) / 60);
-			return h > 0 ? '%dh%dm'.format(h, m) : '%dm'.format(m);
-		};
+// 全部使用“继承主题文字色 + 半透明叠加”，明/暗主题都保持足够对比度
+const css = [
+'.ab-dash{--ab-line:rgba(127,127,127,.24);--ab-tint:rgba(127,127,127,.08);color:inherit;font-size:13.5px;line-height:1.65}',
+'.ab-dash *{box-sizing:border-box}',
+'.ab-grid{display:flex;gap:14px;flex-wrap:wrap;margin:14px 0}',
+'.ab-card{flex:1 1 300px;min-width:280px;border:1px solid var(--ab-line);border-radius:10px;padding:16px 18px;background:var(--ab-tint)}',
+'.ab-card.on{border-color:rgba(40,167,69,.8);background:rgba(40,167,69,.13);box-shadow:0 0 0 1px rgba(40,167,69,.25) inset}',
+'.ab-card h4{margin:0;font-size:15px;font-weight:700;color:inherit}',
+'.ab-head{display:flex;justify-content:space-between;align-items:center;gap:10px;margin-bottom:10px}',
+'.ab-badge{display:inline-block;padding:3px 10px;border-radius:999px;font-size:12px;font-weight:700;color:#fff;white-space:nowrap}',
+'.ab-badge.ok{background:#1f8a3b}',
+'.ab-badge.sb{background:#217a92}',
+'.ab-row{display:flex;gap:10px;align-items:baseline;padding:5px 0;border-top:1px dashed var(--ab-line)}',
+'.ab-card .ab-row:first-of-type{border-top:0}',
+'.ab-k{flex:0 0 84px;opacity:.72;font-weight:600}',
+'.ab-v{flex:1 1 auto;word-break:break-all;color:inherit}',
+'.ab-mono{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:12.5px;letter-spacing:.2px}',
+'.ab-state{display:flex;justify-content:space-between;align-items:center;gap:14px;flex-wrap:wrap;padding:14px 16px;border-radius:10px;border:1px solid var(--ab-line);border-left-width:5px;color:inherit}',
+'.ab-state.ok{border-left-color:#1f8a3b;background:rgba(40,167,69,.11)}',
+'.ab-state.warn{border-left-color:#d08a00;background:rgba(208,138,0,.15)}',
+'.ab-state .t{font-size:14.5px;font-weight:700;color:inherit}',
+'.ab-note{opacity:.82;font-size:12.5px;color:inherit}',
+'.ab-dash code{font-size:12.5px;padding:1px 5px;border-radius:4px;background:rgba(127,127,127,.16)}'
+].join('');
 
-		const container = E('div', { 'class': 'cbi-section' }, [
-			E('h3', {}, _('🛡️ A/B 双槽固件运行与容灾看板')),
-			E('div', { 'class': 'cbi-section-descr' }, [
-				_('本机运行在单盘 A/B 双槽高可用架构下。升级时将新固件写入备用槽，重启通过 GRUB 状态机进行健康检验；若启动异常，系统将自动回滚回旧槽，杜绝升级变砖。')
-			]),
+const slotCard = function(name, info) {
+const on = (curSlot === name);
+const dev = info.device || ('/dev/sda' + (name === 'A' ? '3' : '4'));
+return E('div', { 'class': 'ab-card' + (on ? ' on' : '') }, [
+E('div', { 'class': 'ab-head' }, [
+E('h4', {}, _('槽 %s (Slot %s)').format(name, name)),
+E('span', { 'class': 'ab-badge ' + (on ? 'ok' : 'sb') }, [
+on ? _('✅ 运行中 (ACTIVE)') : _('💤 备用槽 (STANDBY)')
+])
+]),
+E('div', { 'class': 'ab-row' }, [
+E('span', { 'class': 'ab-k' }, _('分区设备')),
+E('span', { 'class': 'ab-v ab-mono' }, dev)
+]),
+E('div', { 'class': 'ab-row' }, [
+E('span', { 'class': 'ab-k' }, 'PARTUUID'),
+E('span', { 'class': 'ab-v ab-mono' }, info.partuuid || '—')
+]),
+E('div', { 'class': 'ab-row' }, [
+E('span', { 'class': 'ab-k' }, _('内核镜像')),
+E('span', { 'class': 'ab-v' }, [
+info.kernel_size ? '%1024.2mB'.format(info.kernel_size) : _('无'),
+info.kernel_time ? E('span', { 'class': 'ab-note' }, '  ' + info.kernel_time) : ''
+])
+])
+]);
+};
 
-			// 双槽对比卡片
-			E('div', { 'style': 'display: flex; gap: 15px; flex-wrap: wrap; margin-bottom: 15px;' }, [
-				// Slot A 卡片
-				E('div', { 'style': 'flex: 1; min-width: 280px; ' + cardStyle + (curSlot === 'A' ? cardActive : '') }, [
-					E('div', { 'style': 'display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px;' }, [
-						E('h4', { 'style': 'margin:0;' }, _('槽 A (Slot A)')),
-						curSlot === 'A' ? badge(_('✅ 运行中 (ACTIVE)'), '#28a745') : badge(_('💤 备用槽 (STANDBY)'), '#17a2b8')
-					]),
-					E('p', { 'style': 'margin: 4px 0; color: inherit;' }, [ E('strong', {}, _('分区设备: ')), slotA.device || '/dev/sda3' ]),
-					E('p', { 'style': 'margin: 4px 0; font-size: 12px; word-break: break-all; opacity: .85; color: inherit;' }, [ E('strong', {}, 'PARTUUID: '), slotA.partuuid || '-' ]),
-					E('p', { 'style': 'margin: 4px 0; color: inherit;' }, [
-						E('strong', {}, _('内核镜像: ')),
-						slotA.kernel_size ? '%1024.2mB (%s)'.format(slotA.kernel_size, slotA.kernel_time || '') : _('无')
-					])
-				]),
+const stateMeta = [
+_('连续失败重试计数: ') + bootCount + ' / 2',
+(!isSafe && remain > 0) ? (_('　·　宽限期剩余 ') + fmtSpan(remain)) : '',
+(!isSafe && conf.state && remain <= 0) ? _('　·　宽限期已过，重启将回滚') : '',
+(grub.next_entry !== '' && grub.next_entry !== undefined) ? (_('　·　一次性引导目标: 槽 ') + (grub.next_entry == '0' ? 'A' : 'B')) : ''
+].join('');
 
-				// Slot B 卡片
-				E('div', { 'style': 'flex: 1; min-width: 280px; ' + cardStyle + (curSlot === 'B' ? cardActive : '') }, [
-					E('div', { 'style': 'display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px;' }, [
-						E('h4', { 'style': 'margin:0;' }, _('槽 B (Slot B)')),
-						curSlot === 'B' ? badge(_('✅ 运行中 (ACTIVE)'), '#28a745') : badge(_('💤 备用槽 (STANDBY)'), '#17a2b8')
-					]),
-					E('p', { 'style': 'margin: 4px 0; color: inherit;' }, [ E('strong', {}, _('分区设备: ')), slotB.device || '/dev/sda4' ]),
-					E('p', { 'style': 'margin: 4px 0; font-size: 12px; word-break: break-all; opacity: .85; color: inherit;' }, [ E('strong', {}, 'PARTUUID: '), slotB.partuuid || '-' ]),
-					E('p', { 'style': 'margin: 4px 0; color: inherit;' }, [
-						E('strong', {}, _('内核镜像: ')),
-						slotB.kernel_size ? '%1024.2mB (%s)'.format(slotB.kernel_size, slotB.kernel_time || '') : _('无')
-					])
-				])
-			]),
+const container = E('div', { 'class': 'cbi-section ab-dash' }, [
+E('style', {}, css),
+E('h3', {}, _('🛡️ A/B 双槽固件运行与容灾看板')),
+E('div', { 'class': 'cbi-section-descr' }, [
+_('本机运行在单盘 A/B 双槽高可用架构下。升级时将新固件写入备用槽，重启通过 GRUB 状态机进行健康检验；若启动异常，系统将自动回滚回旧槽，杜绝升级变砖。')
+]),
 
-			// 引导状态指示条
-			E('div', { 'class': 'alert-message ' + (isSafe ? 'success' : 'warning'), 'style': 'display:flex; justify-content:space-between; align-items:center; gap:12px; flex-wrap:wrap;' }, [
-				E('div', {}, [
-					E('strong', {}, isSafe ? _('✅ 引导状态：已锁定当前槽 (Safe)') : _('⏳ 引导状态：试运行待确认 (Testing)')),
-					E('span', { 'style': 'margin-left: 15px;' }, _('连续失败重试计数: %d / 2').format(bootCount)),
-					(!isSafe && remain > 0) ? E('span', { 'style': 'margin-left: 15px;' }, _('宽限期剩余: %s').format(fmtSpan(remain))) : '',
-					(!isSafe && conf.state && remain <= 0) ? E('span', { 'style': 'margin-left: 15px; color:#c0392b;' }, _('宽限期已过，重启将回滚')) : '',
-					(grub.next_entry !== '' && grub.next_entry !== undefined) ?
-						E('span', { 'style': 'margin-left: 15px; opacity: .85;' }, _('一次性引导目标: 槽 %s').format(grub.next_entry == '0' ? 'A' : 'B')) : ''
-				]),
-				E('div', {}, [
-					!isSafe ? E('button', {
-						'class': 'btn cbi-button-action important',
-						'style': 'margin-right: 8px;',
-						'click': ui.createHandlerFn(this, 'handleMarkBootOk')
-					}, [ _('✅ 确认并锁定当前槽 (ab-confirm)') ]) : '',
-					E('button', {
-						'class': 'btn cbi-button-neutral',
-						'click': ui.createHandlerFn(this, 'handleSwitchSlot', tgtSlot)
-					}, [ _('🔀 切换到备用槽 (%s) 并重启').format(tgtSlot) ])
-				])
-			]),
+E('div', { 'class': 'ab-grid' }, [
+slotCard('A', slotA),
+slotCard('B', slotB)
+]),
 
-			// 固件升级区域
-			E('div', { 'class': 'cbi-section', 'style': 'margin-top: 25px; padding-top: 15px; border-top: 1px dashed #ccc;' }, [
-				E('h3', {}, _('🚀 A/B 双槽平滑升级 (写入备用槽 %s)').format(tgtSlot)),
-				E('p', { 'class': 'cbi-value-description' }, [
-					_('请上传 x86 Combined 固件镜像（支持 .img 或 .img.gz 格式，如 <code>immortalwrt-x86-64-generic-squashfs-combined*.img.gz</code>）。固件将自动写入备用槽，升级全程不影响当前网络运行。')
-				]),
-				E('div', { 'style': 'margin-top: 15px;' }, [
-					E('button', {
-						'class': 'btn cbi-button-action important',
-						'click': ui.createHandlerFn(this, 'handleAbUpload', abInfo)
-					}, [ _('选择固件镜像并上传...') ])
-				])
-			])
-		]);
+// 引导状态指示条
+E('div', { 'class': 'ab-state ' + (isSafe ? 'ok' : 'warn') }, [
+E('div', {}, [
+E('div', { 'class': 't' }, isSafe ? _('✅ 引导状态：已锁定当前槽 (Safe)') : _('⏳ 引导状态：试运行待确认 (Testing)')),
+E('div', { 'class': 'ab-note' }, stateMeta)
+]),
+E('div', {}, [
+!isSafe ? E('button', {
+'class': 'btn cbi-button-action important',
+'style': 'margin-right: 8px;',
+'click': ui.createHandlerFn(this, 'handleMarkBootOk')
+}, [ _('✅ 确认并锁定当前槽 (ab-confirm)') ]) : '',
+E('button', {
+'class': 'btn cbi-button-neutral',
+'click': ui.createHandlerFn(this, 'handleSwitchSlot', tgtSlot)
+}, [ _('🔀 切换到备用槽 (%s) 并重启').format(tgtSlot) ])
+])
+]),
 
-		return container;
-	},
+// 固件升级区域
+E('div', { 'class': 'cbi-section', 'style': 'margin-top: 25px; padding-top: 15px; border-top: 1px dashed var(--ab-line);' }, [
+E('h3', {}, _('🚀 A/B 双槽平滑升级 (写入备用槽 %s)').format(tgtSlot)),
+E('p', { 'class': 'cbi-value-description' }, [
+_('请上传 x86 Combined 固件镜像（支持 .img 或 .img.gz 格式，如 <code>immortalwrt-x86-64-generic-squashfs-combined*.img.gz</code>）。固件将自动写入备用槽，升级全程不影响当前网络运行。')
+]),
+E('div', { 'style': 'margin-top: 15px;' }, [
+E('button', {
+'class': 'btn cbi-button-action important',
+'click': ui.createHandlerFn(this, 'handleAbUpload', abInfo)
+}, [ _('选择固件镜像并上传...') ])
+])
+])
+]);
+
+return container;
+},
 
 	render([ abInfo, hostname, procmtd, procpart, procmounts ]) {
 		const isAbLayout = abInfo && abInfo.is_ab;
