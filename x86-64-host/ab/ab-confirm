@@ -1,0 +1,119 @@
+#!/bin/sh
+# ============================================================================
+# A/B 试运行 -> 人工确认锁定 (ab-confirm)
+#
+#   用法:
+#     ab-confirm          看当前状态，确认后把当前槽锁定为默认启动槽
+#     ab-confirm -y       不问直接锁（脚本/自动化用）
+#     ab-confirm -f       跳过健康提示的拦截（网络不通也想锁时用）
+#
+#   为什么确认权在人手里:
+#     能开机 != 能用。overlay 没建出来、配置没迁过来、容器全灭这类问题
+#     机器自己判断不了，必须人看一眼。所以 GRUB 那条"boot_ok=1 就清 pending"
+#     的自动确认，不由系统自己触发。
+# ============================================================================
+set -eu
+
+if [ -f /usr/lib/ab-lib.sh ]; then
+    . /usr/lib/ab-lib.sh
+elif [ -f "$(dirname "$0")/ab-lib.sh" ]; then
+    . "$(dirname "$0")/ab-lib.sh"
+else
+    echo "!!! 缺少 ab-lib.sh" >&2
+    exit 1
+fi
+
+ASSUME_YES=0
+FORCE=0
+while [ $# -gt 0 ]; do
+    case "$1" in
+        -y|--yes)   ASSUME_YES=1; shift ;;
+        -f|--force) FORCE=1; shift ;;
+        -h|--help)  sed -n '2,18p' "$0"; exit 0 ;;
+        *) ab_die "未知参数: $1" ;;
+    esac
+done
+
+command -v grub-editenv >/dev/null 2>&1 || ab_die "缺少 grub-editenv"
+AB_ENV=$(ab_env_path) || ab_die "找不到 grubenv (内核分区未挂载/非 A/B 布局)"
+
+SLOT_DEVS=$(ab_slot_devs) || ab_die "无法识别 A/B 槽分区"
+SLOT_A_DEV=$(echo "$SLOT_DEVS" | awk '{print $1}')
+SLOT_B_DEV=$(echo "$SLOT_DEVS" | awk '{print $2}')
+CUR_NAME=$(ab_current_slot "$SLOT_A_DEV" "$SLOT_B_DEV") || ab_die "无法判定当前槽"
+case "$CUR_NAME" in
+    0|A) CUR_NAME="A"; CUR_ENTRY=0 ;;
+    1|B) CUR_NAME="B"; CUR_ENTRY=1 ;;
+    *)   ab_die "当前槽异常: $CUR_NAME" ;;
+esac
+
+ENV_PENDING=$(ab_env_get pending 2>/dev/null || true)
+ENV_DEFAULT=$(ab_env_get default 2>/dev/null || true)
+ENV_SLOT=$(ab_env_get pending_slot 2>/dev/null || true)
+ENV_SINCE=$(ab_env_get pending_since 2>/dev/null || true)
+
+# ---- 已是锁定态 ------------------------------------------------------------
+if [ -z "$ENV_PENDING" ]; then
+    if [ "${ENV_DEFAULT:-}" = "$CUR_ENTRY" ]; then
+        ab_info "当前槽 [$CUR_NAME] 已经是锁定状态，无需确认"
+        exit 0
+    fi
+    [ "$FORCE" = 1 ] || ab_die "当前没有待确认的换槽（default=${ENV_DEFAULT:-空} 与运行槽 $CUR_NAME 不一致）。确认要锁定当前槽，加 --force"
+fi
+
+# ---- 待确认目标必须是"正在跑的槽" ------------------------------------------
+if [ -n "$ENV_SLOT" ] && [ "$ENV_SLOT" != "$CUR_ENTRY" ]; then
+    case "$ENV_SLOT" in
+        0) _t="A" ;;
+        1) _t="B" ;;
+        *) _t="?" ;;
+    esac
+    ab_die "待确认的目标是槽 $_t，但当前运行在槽 $CUR_NAME —— 不是同一个槽，拒绝锁定（先重启进目标槽）"
+fi
+
+# ---- 健康提示（只警告，最终由人决定）---------------------------------------
+_net_ok=1
+ip route show default 2>/dev/null | grep -q . || _net_ok=0
+_health_ok=1
+if [ "$_net_ok" = 1 ] && [ -x /etc/ab-health.sh ]; then
+    /etc/ab-health.sh >/dev/null 2>&1 || _health_ok=0
+fi
+if [ "$_net_ok" = 0 ]; then
+    ab_warn "当前没有默认路由：网络可能是坏的"
+    [ "$FORCE" = 1 ] || [ "$ASSUME_YES" = 1 ] || ab_die "确认确实要锁定，请加 --force 重跑"
+elif [ "$_health_ok" = 0 ]; then
+    ab_warn "/etc/ab-health.sh 未通过：健康检查认为这台机器还有问题"
+    [ "$FORCE" = 1 ] || [ "$ASSUME_YES" = 1 ] || ab_die "确认确实要锁定，请加 --force 重跑"
+fi
+
+# ---- 试运行了多久 ----------------------------------------------------------
+case "$ENV_SINCE" in
+    ''|*[!0-9]*) _elapsed="" ;;
+    *) _elapsed=$(( $(date +%s) - ENV_SINCE )) ;;
+esac
+if [ -n "${_elapsed:-}" ] && [ "$_elapsed" -ge 0 ]; then
+    echo "试运行时长  : $((_elapsed / 3600))h$(((_elapsed % 3600) / 60))m"
+fi
+
+if [ "$ASSUME_YES" != 1 ]; then
+    printf "确认锁定当前槽 [%s] 为默认启动槽? 之后每次重启都进这个槽 [y/N] " "$CUR_NAME"
+    read -r ans
+    case "$ans" in
+        y|Y|yes|YES) ;;
+        *) ab_die "已取消（仍处于待确认状态，宽限期后会回滚）" ;;
+    esac
+fi
+
+# ---- 落盘：锁定 ------------------------------------------------------------
+ab_env_set default="$CUR_ENTRY" next_entry="" boot_ok=1 bootcount=0 \
+           pending="" return_to=0 pending_slot="" pending_since=""
+echo "$(date '+%F %T') ab-confirm: 人工确认槽 $CUR_NAME 可用 -> 已锁定(default=$CUR_ENTRY)" >>/etc/ab.log 2>/dev/null
+
+ab_info "已锁定: 默认启动槽 = slot [$CUR_NAME]"
+grub-editenv "$AB_ENV" list 2>/dev/null | sed 's/^/  /'
+
+if [ "$CUR_NAME" = "A" ]; then _other="B"; else _other="A"; fi
+echo
+echo "  之后每次重启都进 slot $CUR_NAME。"
+echo "  要换另一个槽: ab-switch $_other --permanent -y（立即锁定）"
+echo "                ab-switch $_other（试运行，等你再确认）"

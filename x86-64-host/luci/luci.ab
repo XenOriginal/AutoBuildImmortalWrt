@@ -69,11 +69,15 @@ case "$1" in
 		json_cleanup
 		;;
 	"bootok")
-		if command -v ab-bootok >/dev/null 2>&1; then
+		# 优先走 ab-confirm（锁定默认槽 / 清 pending），否则回退到 init.d confirm
+		if command -v ab-confirm >/dev/null 2>&1; then
+			out=$(ab-confirm -y 2>&1)
+			rc=$?
+		elif [ -x /etc/init.d/ab-bootok ]; then
 			out=$(/etc/init.d/ab-bootok confirm 2>&1)
 			rc=$?
 		else
-			out="ab-bootok not found"
+			out="未找到 ab-confirm / ab-bootok"
 			rc=1
 		fi
 		json_init

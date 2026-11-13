@@ -154,7 +154,7 @@ return view.extend({
 				E('p', {}, _('<strong>安全防护保障机制：</strong>')),
 				E('ul', {}, [
 					E('li', {}, _('本次切换采用 <strong>一次性试跑 (next_entry)</strong> 模式；')),
-					E('li', {}, _('新槽启动后通过网络可达性与系统检查，自动标记健康 (boot_ok=1)；')),
+					E('li', {}, _('新槽启动后需在本页「确认并锁定」人工确认 (ab-confirm)，宽限期内未确认将自动回滚；')),
 					E('li', {}, _('若目标槽内核异常或网络无法连通，GRUB 引导器将在连续 2 次重试后 <strong>自动无缝回滚回当前槽</strong>，无需串口插线！'))
 				])
 			]),
@@ -185,16 +185,16 @@ return view.extend({
 
 	// 手动标记健康
 	handleMarkBootOk() {
-		ui.showModal(_('正在标记...'), [
-			E('p', { 'class': 'spinning' }, _('正在将 boot_ok=1 写入 grubenv...'))
+		ui.showModal(_('正在确认并锁定...'), [
+			E('p', { 'class': 'spinning' }, _('正在执行 ab-confirm：锁定当前槽并清除 pending...'))
 		]);
 		return callAbBootOk().then(function(res) {
 			ui.hideModal();
 			if (res.code === 0) {
-				ui.addNotification(null, E('p', _('✅ 已成功将当前启动标记为健康 (boot_ok=1, bootcount=0)！')), 'info');
+				ui.addNotification(null, E('p', _('✅ 已确认并锁定当前槽为默认启动槽！')), 'info');
 				window.location.reload();
 			} else {
-				ui.addNotification(null, E('p', _('❌ 标记失败: %s').format(res.output)));
+				ui.addNotification(null, E('p', _('❌ 确认失败: %s').format(res.output)));
 			}
 		}).catch(function(err) {
 			ui.hideModal();
@@ -362,12 +362,23 @@ return view.extend({
 		const slotB = abInfo.slot_b || {};
 		const grub = abInfo.grubenv || {};
 
-		const isSafe = (grub.boot_ok == '1');
+		const conf = abInfo.confirm || {};
+		const pending = (grub.pending === '1' || grub.pending === 1);
+		const isSafe = !pending && ((conf.state === 'locked') || (grub.boot_ok == '1'));
 		const bootCount = grub.bootcount || 0;
+		const remain = parseInt(conf.remaining_sec, 10) || 0;
 
-		const cardStyle = 'border: 1px solid #ddd; border-radius: 6px; padding: 15px; margin-bottom: 15px; background: #fafafa;';
-		const activeBadge = '<span style="background: #28a745; color: white; padding: 3px 8px; border-radius: 12px; font-weight: bold; font-size: 12px;">✅ 运行中 (ACTIVE)</span>';
-		const standbyBadge = '<span style="background: #17a2b8; color: white; padding: 3px 8px; border-radius: 12px; font-weight: bold; font-size: 12px;">💤 备用槽 (STANDBY)</span>';
+		// 主题自适应配色：半透明叠加在当前主题背景上，明/暗主题都可读
+		const cardStyle = 'border:1px solid var(--ab-card-bd, rgba(127,127,127,.28)); border-radius:6px; padding:15px; margin-bottom:15px; background:var(--ab-card-bg, rgba(127,127,127,.07)); color:inherit;';
+		const cardActive = 'border-color:#28a745; background:rgba(40,167,69,.10);';
+		const badge = function(text, bg) {
+			return E('span', { 'style': 'background:' + bg + '; color:#fff; padding:3px 8px; border-radius:12px; font-weight:bold; font-size:12px; white-space:nowrap;' }, [ text ]);
+		};
+		const fmtSpan = function(sec) {
+			sec = Math.max(0, sec | 0);
+			const h = Math.floor(sec / 3600), m = Math.floor((sec % 3600) / 60);
+			return h > 0 ? '%dh%dm'.format(h, m) : '%dm'.format(m);
+		};
 
 		const container = E('div', { 'class': 'cbi-section' }, [
 			E('h3', {}, _('🛡️ A/B 双槽固件运行与容灾看板')),
@@ -378,28 +389,28 @@ return view.extend({
 			// 双槽对比卡片
 			E('div', { 'style': 'display: flex; gap: 15px; flex-wrap: wrap; margin-bottom: 15px;' }, [
 				// Slot A 卡片
-				E('div', { 'style': 'flex: 1; min-width: 280px; ' + cardStyle + (curSlot === 'A' ? 'border-color: #28a745; background: #f6fff6;' : '') }, [
+				E('div', { 'style': 'flex: 1; min-width: 280px; ' + cardStyle + (curSlot === 'A' ? cardActive : '') }, [
 					E('div', { 'style': 'display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px;' }, [
 						E('h4', { 'style': 'margin:0;' }, _('槽 A (Slot A)')),
-						E('span', {}, curSlot === 'A' ? activeBadge : standbyBadge)
+						curSlot === 'A' ? badge(_('✅ 运行中 (ACTIVE)'), '#28a745') : badge(_('💤 备用槽 (STANDBY)'), '#17a2b8')
 					]),
-					E('p', { 'style': 'margin: 4px 0;' }, [ E('strong', {}, _('分区设备: ')), slotA.device || '/dev/sda3' ]),
-					E('p', { 'style': 'margin: 4px 0; font-size: 11px; word-break: break-all;' }, [ E('strong', {}, 'PARTUUID: '), slotA.partuuid || '-' ]),
-					E('p', { 'style': 'margin: 4px 0;' }, [
+					E('p', { 'style': 'margin: 4px 0; color: inherit;' }, [ E('strong', {}, _('分区设备: ')), slotA.device || '/dev/sda3' ]),
+					E('p', { 'style': 'margin: 4px 0; font-size: 12px; word-break: break-all; opacity: .85; color: inherit;' }, [ E('strong', {}, 'PARTUUID: '), slotA.partuuid || '-' ]),
+					E('p', { 'style': 'margin: 4px 0; color: inherit;' }, [
 						E('strong', {}, _('内核镜像: ')),
 						slotA.kernel_size ? '%1024.2mB (%s)'.format(slotA.kernel_size, slotA.kernel_time || '') : _('无')
 					])
 				]),
 
 				// Slot B 卡片
-				E('div', { 'style': 'flex: 1; min-width: 280px; ' + cardStyle + (curSlot === 'B' ? 'border-color: #28a745; background: #f6fff6;' : '') }, [
+				E('div', { 'style': 'flex: 1; min-width: 280px; ' + cardStyle + (curSlot === 'B' ? cardActive : '') }, [
 					E('div', { 'style': 'display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px;' }, [
 						E('h4', { 'style': 'margin:0;' }, _('槽 B (Slot B)')),
-						E('span', {}, curSlot === 'B' ? activeBadge : standbyBadge)
+						curSlot === 'B' ? badge(_('✅ 运行中 (ACTIVE)'), '#28a745') : badge(_('💤 备用槽 (STANDBY)'), '#17a2b8')
 					]),
-					E('p', { 'style': 'margin: 4px 0;' }, [ E('strong', {}, _('分区设备: ')), slotB.device || '/dev/sda4' ]),
-					E('p', { 'style': 'margin: 4px 0; font-size: 11px; word-break: break-all;' }, [ E('strong', {}, 'PARTUUID: '), slotB.partuuid || '-' ]),
-					E('p', { 'style': 'margin: 4px 0;' }, [
+					E('p', { 'style': 'margin: 4px 0; color: inherit;' }, [ E('strong', {}, _('分区设备: ')), slotB.device || '/dev/sda4' ]),
+					E('p', { 'style': 'margin: 4px 0; font-size: 12px; word-break: break-all; opacity: .85; color: inherit;' }, [ E('strong', {}, 'PARTUUID: '), slotB.partuuid || '-' ]),
+					E('p', { 'style': 'margin: 4px 0; color: inherit;' }, [
 						E('strong', {}, _('内核镜像: ')),
 						slotB.kernel_size ? '%1024.2mB (%s)'.format(slotB.kernel_size, slotB.kernel_time || '') : _('无')
 					])
@@ -407,19 +418,21 @@ return view.extend({
 			]),
 
 			// 引导状态指示条
-			E('div', { 'class': 'alert-message ' + (isSafe ? 'success' : 'warning'), 'style': 'display: flex; justify-content: space-between; align-items: center;' }, [
+			E('div', { 'class': 'alert-message ' + (isSafe ? 'success' : 'warning'), 'style': 'display:flex; justify-content:space-between; align-items:center; gap:12px; flex-wrap:wrap;' }, [
 				E('div', {}, [
-					E('strong', {}, isSafe ? _('✅ 引导状态：已标记健康 (Safe)') : _('⏳ 引导状态：试运行待确认 (Testing)')),
-					E('span', { 'style': 'margin-left: 15px;' }, _('连续失败重试计数: <strong>%d / 2</strong>').format(bootCount)),
-					grub.next_entry !== '' && grub.next_entry !== undefined ?
-						E('span', { 'style': 'margin-left: 15px; color: #0056b3;' }, _('一次性引导目标: 槽 %s').format(grub.next_entry == '0' ? 'A' : 'B')) : ''
+					E('strong', {}, isSafe ? _('✅ 引导状态：已锁定当前槽 (Safe)') : _('⏳ 引导状态：试运行待确认 (Testing)')),
+					E('span', { 'style': 'margin-left: 15px;' }, _('连续失败重试计数: %d / 2').format(bootCount)),
+					(!isSafe && remain > 0) ? E('span', { 'style': 'margin-left: 15px;' }, _('宽限期剩余: %s').format(fmtSpan(remain))) : '',
+					(!isSafe && conf.state && remain <= 0) ? E('span', { 'style': 'margin-left: 15px; color:#c0392b;' }, _('宽限期已过，重启将回滚')) : '',
+					(grub.next_entry !== '' && grub.next_entry !== undefined) ?
+						E('span', { 'style': 'margin-left: 15px; opacity: .85;' }, _('一次性引导目标: 槽 %s').format(grub.next_entry == '0' ? 'A' : 'B')) : ''
 				]),
 				E('div', {}, [
 					!isSafe ? E('button', {
-						'class': 'btn cbi-button-action',
+						'class': 'btn cbi-button-action important',
 						'style': 'margin-right: 8px;',
 						'click': ui.createHandlerFn(this, 'handleMarkBootOk')
-					}, [ _('✅ 立即确认健康 (标记 boot_ok)') ]) : '',
+					}, [ _('✅ 确认并锁定当前槽 (ab-confirm)') ]) : '',
 					E('button', {
 						'class': 'btn cbi-button-neutral',
 						'click': ui.createHandlerFn(this, 'handleSwitchSlot', tgtSlot)

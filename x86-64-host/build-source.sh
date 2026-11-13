@@ -217,6 +217,7 @@ else
   install -m 0755 "$SCRIPT_DIR/ab/ab-upgrade" "$SRC_DIR/files/usr/sbin/ab-upgrade"
   install -m 0755 "$SCRIPT_DIR/ab/ab-status"  "$SRC_DIR/files/usr/sbin/ab-status"
   install -m 0755 "$SCRIPT_DIR/ab/ab-switch"  "$SRC_DIR/files/usr/sbin/ab-switch"
+  install -m 0755 "$SCRIPT_DIR/ab/ab-confirm" "$SRC_DIR/files/usr/sbin/ab-confirm"
   install -m 0755 "$SCRIPT_DIR/ab/sysupgrade-wrapper" "$SRC_DIR/files/usr/sbin/sysupgrade"
   install -m 0644 "$SCRIPT_DIR/ab/ab-lib.sh"  "$SRC_DIR/files/usr/lib/ab-lib.sh"
   install -m 0644 "$SCRIPT_DIR/ab/grub.cfg.ab.tmpl" "$SRC_DIR/files/usr/lib/ab-grub.cfg.tmpl"
@@ -239,7 +240,7 @@ else
       etc/hotplug.d/block/00-fsck-guard \
       usr/local/bin/fsck-guard usr/local/bin/nfs-guard usr/local/bin/powerguard \
       usr/sbin/hw-health usr/lib/wrtpatch/poweroff.wrapper \
-      usr/sbin/ab-upgrade usr/sbin/ab-status usr/sbin/ab-switch usr/sbin/sysupgrade \
+      usr/sbin/ab-upgrade usr/sbin/ab-status usr/sbin/ab-switch usr/sbin/ab-confirm usr/sbin/sysupgrade \
       usr/lib/ab-lib.sh usr/lib/ab-grub.cfg.tmpl etc/init.d/ab-bootok \
       etc/rc.d/S10fsck-guard etc/rc.d/S20microcode-load etc/rc.d/S95ab-bootok etc/rc.d/S96hw-watchdog \
       etc/rc.d/S97hw-healthd etc/rc.d/S97nfs-guard etc/rc.d/K86nfs-guard \
@@ -1143,7 +1144,7 @@ for rd in $ROOTFS_DIRS; do
     ROOTFS_SEEN=1
     miss=""
     for f in \
-        usr/sbin/ab-upgrade usr/sbin/ab-status usr/sbin/ab-switch usr/sbin/sysupgrade \
+        usr/sbin/ab-upgrade usr/sbin/ab-status usr/sbin/ab-switch usr/sbin/ab-confirm usr/sbin/sysupgrade \
         usr/lib/ab-lib.sh usr/lib/ab-grub.cfg.tmpl etc/init.d/ab-bootok \
         usr/libexec/rpcd/luci.ab usr/share/rpcd/acl.d/luci-app-ab-upgrade.json \
         www/luci-static/resources/view/system/flash.js \
